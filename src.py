@@ -261,7 +261,7 @@ class ToolTip(object):
 class PicForensicsApp:
     def __init__(self, master):
         self.master = master
-        master.title("PicForensics - Professional")
+        master.title("PicForensics")
         master.geometry("1100x700")
         self.theme = StringVar(value="light")
         self.create_menu()
@@ -347,7 +347,7 @@ class PicForensicsApp:
         menubar.add_cascade(label="View", menu=view_menu)
 
         help_menu = Menu(menubar, tearoff=0)
-        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "PicForensics - Professional\nEXIF, ELA, Noise, Timeline, Report"))
+        help_menu.add_command(label="About", command=lambda: messagebox.showinfo("About", "PicForensics \nEXIF, ELA, Noise, Timeline, Report"))
         help_menu.add_command(label="Help/Manual", command=self.show_help_window)
         menubar.add_cascade(label="Help", menu=help_menu)
 
@@ -671,7 +671,7 @@ class PicForensicsApp:
         c.save()
 
     def show_about(self):
-        messagebox.showinfo("About", "PicForensics Professional\nBuilt for image metadata & tamper analysis.")
+        messagebox.showinfo("About", "PicForensics \nBuilt for image metadata & tamper analysis.")
 
 def main():
     root = Tk()
