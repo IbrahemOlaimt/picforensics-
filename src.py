@@ -1,35 +1,109 @@
-
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-from PIL import Image, ImageTk, ImageEnhance
+from tkinter import ttk, messagebox, filedialog, simpledialog, Toplevel
+from PIL import Image, ImageTk, ImageEnhance, ImageChops
 import os
 import numpy as np
 import cv2
-from PIL import Image, ImageChops
-import tempfile
-import logging
-from collections import deque
-from datetime import datetime
-from PIL.ExifTags import TAGS
-import pyexiv2
+import shutil
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Util.Padding import pad, unpad
+import json
 import io
-import math
-import torch
-import torch.nn as nn
-import torchvision.transforms as T
-import timm
-from scipy import fftpack
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-import joblib
+import warnings
+import pyexiv2
+from PIL.ExifTags import TAGS
+from datetime import datetime, timedelta
+import tempfile
+import exifread
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut
+import hashlib
+from pathlib import Path
+from dataclasses import dataclass
+from skimage.util import view_as_blocks
+import matplotlib.pyplot as plt
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+warnings.filterwarnings('ignore')
+
+def compute_image_hash(file_path: str) -> str:
+    sha = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            sha.update(chunk)
+    return sha.hexdigest()
+
+
+def _load_hash_registry(registry_file: str):
+    try:
+        if os.path.exists(registry_file):
+            with open(registry_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+
+def _save_hash_registry(registry_file: str, registry_list):
+    # atomic-ish save
+    tmp = registry_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(registry_list, f, indent=4, ensure_ascii=False)
+    os.replace(tmp, registry_file)
+
+
+def save_hash_to_registry(registry_file: str, key: str, img_hash: str, meta: dict | None = None):
+
+    registry = _load_hash_registry(registry_file)
+    registry = [e for e in registry if e.get("key") != key]
+    entry = {
+        "key": key,
+        "hash": img_hash,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    if meta:
+        entry.update(meta)
+    registry.append(entry)
+    _save_hash_registry(registry_file, registry)
+
+
+def get_previous_hash(registry_file: str, key: str):
+    registry = _load_hash_registry(registry_file)
+    for e in registry:
+        if e.get("key") == key:
+            return e.get("hash")
+    return None
+
+
+def compare_hashes(old_hash: str | None, new_hash: str) -> str:
+    if old_hash is None:
+        return "FIRST"
+    if old_hash == new_hash:
+        return "MATCH"
+    return "MODIFIED"
+
+
+def compute_case_hash(image_paths: list[str]) -> str:
+
+    pairs = []
+    for p in sorted(image_paths, key=lambda x: os.path.basename(x).lower()):
+        try:
+            pairs.append(f"{os.path.basename(p)}:{compute_image_hash(p)}")
+        except Exception:
+            pairs.append(f"{os.path.basename(p)}:ERROR")
+    combined = "\n".join(pairs).encode("utf-8", errors="ignore")
+    return hashlib.sha256(combined).hexdigest()
 
 
 def compute_ela(image_path, q=90):
     try:
-        orig = Image.open(image_path).convert('RGB')
+        if isinstance(image_path, str):
+            orig = Image.open(image_path).convert('RGB')
+        else:
+            orig = image_path.convert('RGB') if hasattr(image_path, 'convert') else Image.open(
+                io.BytesIO(image_path)).convert('RGB')
         buffer = io.BytesIO()
         orig.save(buffer, "JPEG", quality=q)
         buffer.seek(0)
@@ -41,166 +115,515 @@ def compute_ela(image_path, q=90):
         ela_img = ImageEnhance.Brightness(diff).enhance(scale)
         return ela_img
     except Exception as e:
-        logger.error(f"ELA computation failed: {e}")
         return None
 
+def extract_noise_stat(img):
+    if isinstance(img, str):
+        img = Image.open(img)
+    gray = img.convert("L")
+    arr = np.asarray(gray).astype(np.float32)
+    lap = cv2.Laplacian(arr, cv2.CV_32F)
+    return lap
 
-def extract_noise(image_path):
+def derive_key_from_password(password, salt):
+    key = PBKDF2(password, salt, dkLen=16, count=100000)
+    return key
+
+def encrypt_image_data(image_data, password):
     try:
-        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
-        if img is None:
-            return np.zeros((100, 100), dtype=np.float32)
-        img_f = np.float32(img) / 255.0
-        d = cv2.fastNlMeansDenoisingColored(img.astype(np.uint8), None, 10, 10, 7, 21)
-        d_f = np.float32(d) / 255.0
-        residual = img_f - d_f
-        g = cv2.cvtColor((residual * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY)
-        return (g - g.mean()) / (g.std() + 1e-8)
+        salt = get_random_bytes(16)
+        key = derive_key_from_password(password, salt)
+        iv = get_random_bytes(16)
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        encrypted_data = cipher.encrypt(pad(image_data, AES.block_size))
+        return salt + iv + encrypted_data
     except Exception as e:
-        logger.error(f"Noise extraction failed: {e}")
-        return np.zeros((100, 100), dtype=np.float32)
+        return None
 
-
-def fft_features(image_path):
+def decrypt_image_data(encrypted_data, password):
     try:
-        img = Image.open(image_path).convert("L")
-        arr = np.asarray(img).astype(np.float32)
-        F = fftpack.fftshift(fftpack.fft2(arr))
-        mag = np.log1p(np.abs(F))
-        return mag.std()
+        salt = encrypted_data[:16]
+        iv = encrypted_data[16:32]
+        encrypted_content = encrypted_data[32:]
+        key = derive_key_from_password(password, salt)
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        decrypted_data = unpad(cipher.decrypt(encrypted_content), AES.block_size)
+        return decrypted_data
     except Exception as e:
-        logger.error(f"FFT features failed: {e}")
-        return 0.0
+        return None
 
+@dataclass
+class ForensicAnalysis:
+    tampering_indicators: list
+    consistency_score: float
+    editing_software_detected: list
 
-class Embedding:
-    def __init__(self, name, device, size=224):
-        try:
-            self.model = timm.create_model(name, pretrained=True, num_classes=0, global_pool="avg").to(device)
-            self.model.eval()
-            self.device = device
-            self.tf = T.Compose([
-                T.Resize((size, size)),
-                T.ToTensor(),
-                T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-            ])
-        except Exception as e:
-            logger.error(f"Embedding model {name} failed: {e}")
-            self.model = None
+class AdvancedMetadataExtractor:
+    def __init__(self, enable_cache: bool = True, enable_geocoding: bool = True):
+        self.enable_cache = enable_cache
+        self.enable_geocoding = enable_geocoding
+        self.cache = {}
+        self.geolocator = None
 
-    def extract(self, img):
-        if self.model is None:
-            return np.zeros(1000, dtype=np.float32)
-        try:
-            t = self.tf(img).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                feat = self.model(t).cpu().numpy().flatten()
-            return feat
-        except Exception as e:
-            logger.error(f"Feature extraction failed: {e}")
-            return np.zeros(1000, dtype=np.float32)
+        if enable_geocoding:
+            try:
+                self.geolocator = Nominatim(user_agent="metadata_extractor_v1")
+            except:
+                self.geolocator = None
 
+        self.editing_software_indicators = [
+            'photoshop', 'adobe', 'lightroom', 'gimp', 'paint.net',
+            'affinity', 'coreldraw', 'photoscape', 'paintshop', 'capture'
+        ]
 
-class SmallNoiseCNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(64, 128)
-        )
-
-    def forward(self, x): return self.net(x)
-
-
-class CombinedAIDetectorMinimal:
-    def __init__(self, device="cpu"):
-        self.device = device
-        self.effnet = Embedding("efficientnet_b0", device)
-        self.vit = Embedding("vit_base_patch16_224", device)
-        self.noise_model = SmallNoiseCNN().to(device)
-        self.noise_model.eval()
-        self.scaler = StandardScaler()
-        self.clf = LogisticRegression()
-        self._initialize_fallback_model()
-
-    def _initialize_fallback_model(self):
-        self.fallback_weights = {
-            'noise_std': 0.3,
-            'fft_features': 0.3,
-            'file_characteristics': 0.4
+        self.camera_brand_patterns = {
+            'canon': ['canon', 'eos', 'powershot', 'ixus'],
+            'nikon': ['nikon', 'd', 'coolpix', 'z'],
+            'sony': ['sony', 'dsc', 'alpha', 'cyber-shot'],
+            'fujifilm': ['fujifilm', 'finepix', 'x-', 'gf'],
+            'panasonic': ['panasonic', 'lumix'],
+            'olympus': ['olympus', 'om-d', 'pen'],
+            'apple': ['apple', 'iphone', 'ipad'],
+            'samsung': ['samsung', 'galaxy']
         }
 
-    def extract_features(self, path):
+    def extract_comprehensive_metadata(self, image_path):
         try:
-            img = Image.open(path).convert("RGB")
-            f1 = self.effnet.extract(img)
-            f2 = self.vit.extract(img)
-            ela_img = compute_ela(path)
-            f3 = self.effnet.extract(ela_img) if ela_img else np.zeros(1000)
-            noise = extract_noise(path)
-            noise_r = cv2.resize(noise, (128, 128))
-            t = torch.from_numpy(noise_r).float().unsqueeze(0).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                f4 = self.noise_model(t).cpu().numpy().flatten()
-            fft_std = fft_features(path)
-            f5 = np.array([fft_std], dtype=np.float32)
-            return np.concatenate([f1, f2, f3, f4, f5])
+            cache_key = self._generate_cache_key(image_path)
+            if self.enable_cache and cache_key in self.cache:
+                return self.cache[cache_key]
+
+            if not self._validate_file(image_path):
+                return {"error": "Invalid image file or file not found"}
+
+            metadata = self._extract_all_exif_data(image_path)
+
+            if not metadata:
+                return {"error": "No metadata found in image"}
+
+            result = {
+                "file_information": self._get_file_information(image_path),
+                "camera_information": self._extract_camera_info(metadata),
+                "shooting_parameters": self._extract_shooting_parameters(metadata),
+                "image_properties": self._extract_image_properties(metadata),
+                "gps_data": self._extract_gps_data(metadata),
+                "date_time_information": self._extract_datetime_info(metadata),
+                "software_info": self._extract_software_info(metadata),
+                "forensic_analysis": self._perform_forensic_analysis(metadata)
+            }
+
+            result = {k: v for k, v in result.items() if v}
+
+            if self.enable_cache:
+                self.cache[cache_key] = result
+
+            return result
+
         except Exception as e:
-            logger.error(f"Feature extraction failed: {e}")
-            return self._extract_fallback_features(path)
+            return {"error": f"Extraction failed: {str(e)}"}
 
-    def _extract_fallback_features(self, path):
+    def _validate_file(self, image_path):
+        if not os.path.exists(image_path):
+            return False
+
+        valid_extensions = {'.jpg', '.jpeg', '.png', '.tiff', '.tif', '.heic', '.webp', '.bmp', '.gif'}
+        return Path(image_path).suffix.lower() in valid_extensions
+
+    def _generate_cache_key(self, file_path):
         try:
-            noise = extract_noise(path)
-            fft_std = fft_features(path)
-            img = Image.open(path)
-            file_size = os.path.getsize(path) / (1024 * 1024)
-            mp_ratio = (img.width * img.height) / (file_size * 1000000) if file_size > 0 else 0
-            return np.array([noise.std(), fft_std, mp_ratio], dtype=np.float32)
+            stat = os.stat(file_path)
+            key_data = f"{file_path}_{stat.st_size}_{stat.st_mtime}"
+            return hashlib.md5(key_data.encode()).hexdigest()
         except:
-            return np.array([0.5, 0.5, 0.5], dtype=np.float32)
+            return hashlib.md5(file_path.encode()).hexdigest()
 
-    def analyze(self, path):
+    def _extract_all_exif_data(self, image_path):
+        metadata = {}
+
         try:
-            feats = self.extract_features(path).reshape(1, -1)
-            if hasattr(self.scaler, 'mean_') and hasattr(self.clf, 'classes_'):
-                feats_s = self.scaler.transform(feats)
-                p = float(self.clf.predict_proba(feats_s)[0, 1])
-            else:
-                p = self._fallback_analysis(path)
-        except Exception as e:
-            logger.error(f"Analysis failed: {e}")
-            p = self._fallback_analysis(path)
+            with open(image_path, 'rb') as f:
+                tags = exifread.process_file(f, details=False)
 
-        conf = (
-            "VERY HIGH" if p > 0.90 else
-            "HIGH" if p > 0.75 else
-            "MEDIUM" if p > 0.50 else
-            "LOW" if p > 0.25 else
-            "VERY LOW"
-        )
+                for tag, value in tags.items():
+                    if tag not in ['JPEGThumbnail', 'TIFFThumbnail', 'Filename', 'EXIF MakerNote']:
+                        metadata[str(tag)] = self._clean_value(value)
 
-        return {"ai_probability": round(p, 4), "confidence": conf}
+        except Exception:
+            return {}
 
-    def _fallback_analysis(self, path):
+        return metadata
+
+    def _clean_value(self, value):
+        if hasattr(value, 'printable'):
+            return str(value.printable)
+        elif isinstance(value, bytes):
+            try:
+                return value.decode('utf-8', errors='ignore').strip()
+            except:
+                return str(value)[:100]
+        return str(value)
+
+    def _get_file_information(self, image_path):
         try:
-            noise = extract_noise(path)
-            fft_std = fft_features(path)
-            img = Image.open(path)
-            file_size = os.path.getsize(path) / (1024 * 1024)
-            score = 0.0
-            score += (1.0 - min(noise.std() / 10.0, 1.0)) * self.fallback_weights['noise_std']
-            score += min(fft_std / 50.0, 1.0) * self.fallback_weights['fft_features']
-            if file_size > 0 and (img.width * img.height) / (file_size * 1000000) > 10:
-                score += 0.3 * self.fallback_weights['file_characteristics']
-            return min(score, 1.0)
+            stat = os.stat(image_path)
+            info = {
+                "file_name": os.path.basename(image_path),
+                "file_size_bytes": stat.st_size,
+                "file_size_human": self._format_bytes(stat.st_size),
+                "file_extension": Path(image_path).suffix.lower(),
+                "last_modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "file_hash_md5": self._calculate_file_hash(image_path)
+            }
+            return info
         except:
-            return 0.5
+            return {}
 
+    def _calculate_file_hash(self, file_path):
+        try:
+            hash_md5 = hashlib.md5()
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(8192), b""):
+                    hash_md5.update(chunk)
+            return hash_md5.hexdigest()
+        except:
+            return ""
+
+    def _extract_camera_info(self, metadata):
+        info = {}
+
+        camera_mapping = {
+            'Make': 'make',
+            'Model': 'model',
+            'BodySerialNumber': 'serial_number',
+            'LensModel': 'lens_model',
+            'LensSerialNumber': 'lens_serial',
+            'LensMake': 'lens_make',
+            'FocalLength': 'focal_length'
+        }
+
+        for exif_field, output_field in camera_mapping.items():
+            for prefix in ['', 'EXIF ', 'Image ']:
+                key = f"{prefix}{exif_field}"
+                if key in metadata and metadata[key]:
+                    info[output_field] = metadata[key]
+                    break
+
+        return info if info else {}
+
+    def _extract_shooting_parameters(self, metadata):
+        params = {}
+
+        shooting_mapping = {
+            'ExposureTime': 'exposure_time',
+            'FNumber': 'f_number',
+            'ISOSpeedRatings': 'iso',
+            'ExposureProgram': 'exposure_program',
+            'ExposureMode': 'exposure_mode',
+            'ExposureBiasValue': 'exposure_compensation',
+            'MeteringMode': 'metering_mode',
+            'Flash': 'flash',
+            'WhiteBalance': 'white_balance'
+        }
+
+        for exif_field, output_field in shooting_mapping.items():
+            for prefix in ['', 'EXIF ']:
+                key = f"{prefix}{exif_field}"
+                if key in metadata and metadata[key]:
+                    params[output_field] = metadata[key]
+                    break
+
+        return params if params else {}
+
+    def _extract_image_properties(self, metadata):
+        props = {}
+
+        property_mapping = {
+            'ImageWidth': 'width',
+            'ImageLength': 'height',
+            'ExifImageWidth': 'exif_width',
+            'ExifImageHeight': 'exif_height',
+            'XResolution': 'x_resolution',
+            'YResolution': 'y_resolution',
+            'Orientation': 'orientation',
+            'ColorSpace': 'color_space'
+        }
+
+        for exif_field, output_field in property_mapping.items():
+            for prefix in ['', 'Image ', 'EXIF ']:
+                key = f"{prefix}{exif_field}"
+                if key in metadata and metadata[key]:
+                    props[output_field] = metadata[key]
+                    break
+
+        return props if props else {}
+
+    def _extract_gps_data(self, metadata):
+        gps_data = {}
+
+        try:
+            lat_key = 'GPS GPSLatitude'
+            lat_ref_key = 'GPS GPSLatitudeRef'
+            lon_key = 'GPS GPSLongitude'
+            lon_ref_key = 'GPS GPSLongitudeRef'
+
+            if lat_key in metadata and lat_ref_key in metadata and lon_key in metadata and lon_ref_key in metadata:
+                lat = self._convert_gps_coordinate(metadata[lat_key])
+                lat_ref = str(metadata[lat_ref_key])
+                if lat_ref.upper() == 'S':
+                    lat = -lat
+
+                lon = self._convert_gps_coordinate(metadata[lon_key])
+                lon_ref = str(metadata[lon_ref_key])
+                if lon_ref.upper() == 'W':
+                    lon = -lon
+
+                if -90 <= lat <= 90 and -180 <= lon <= 180:
+                    gps_data["latitude"] = lat
+                    gps_data["longitude"] = lon
+
+                    if self.geolocator:
+                        try:
+                            location = self.geolocator.reverse(
+                                f"{lat}, {lon}",
+                                timeout=5
+                            )
+                            if location and location.address:
+                                gps_data["address"] = location.address[:200]
+                        except:
+                            pass
+
+            altitude_key = 'GPS GPSAltitude'
+            if altitude_key in metadata:
+                try:
+                    alt_str = str(metadata[altitude_key])
+                    if ' ' in alt_str:
+                        alt_str = alt_str.split()[0]
+                    altitude = float(alt_str)
+                    gps_data["altitude"] = altitude
+                except:
+                    pass
+
+        except:
+            return {}
+
+        return gps_data if gps_data else {}
+
+    def _convert_gps_coordinate(self, gps_str):
+        try:
+            if isinstance(gps_str, str):
+                gps_str = gps_str.replace('[', '').replace(']', '')
+                parts = [p.strip() for p in gps_str.split(',')]
+
+                if len(parts) == 3:
+                    def parse_part(part):
+                        if '/' in part:
+                            num, den = part.split('/')
+                            return float(num) / float(den)
+                        return float(part)
+
+                    degrees = parse_part(parts[0])
+                    minutes = parse_part(parts[1])
+                    seconds = parse_part(parts[2])
+
+                    return degrees + (minutes / 60.0) + (seconds / 3600.0)
+        except:
+            pass
+
+        try:
+            return float(gps_str)
+        except:
+            return 0.0
+
+    def _extract_datetime_info(self, metadata):
+        datetime_info = {}
+
+        datetime_mapping = {
+            'DateTimeOriginal': 'original_date',
+            'DateTimeDigitized': 'digitized_date',
+            'DateTime': 'file_modification_date',
+            'CreateDate': 'creation_date'
+        }
+
+        for exif_field, output_field in datetime_mapping.items():
+            for prefix in ['', 'EXIF ', 'Image ']:
+                key = f"{prefix}{exif_field}"
+                if key in metadata and metadata[key]:
+                    datetime_info[output_field] = metadata[key]
+                    break
+
+        return datetime_info if datetime_info else {}
+
+    def _extract_software_info(self, metadata):
+        software_info = {}
+
+        if 'Software' in metadata and metadata['Software']:
+            software_info["software"] = metadata['Software']
+
+        if 'Copyright' in metadata and metadata['Copyright']:
+            software_info["copyright"] = metadata['Copyright']
+
+        if 'Artist' in metadata and metadata['Artist']:
+            software_info["artist"] = metadata['Artist']
+
+        return software_info if software_info else {}
+
+    def _perform_forensic_analysis(self, metadata):
+        analysis = {
+            "consistency_score": 1.0,
+            "editing_software_detected": []
+        }
+
+        software = str(metadata.get('EXIF Software', '')).lower()
+        if software:
+            detected = []
+            for indicator in self.editing_software_indicators:
+                if indicator in software:
+                    detected.append(indicator.title())
+            if detected:
+                analysis["editing_software_detected"] = detected
+                analysis["consistency_score"] *= 0.9
+
+        time_issues = self._analyze_time_inconsistencies(metadata)
+        if time_issues:
+            analysis["consistency_score"] *= 0.8
+
+        device_issues = self._analyze_device_inconsistencies(metadata)
+        if device_issues:
+            analysis["consistency_score"] *= 0.85
+
+        analysis["consistency_score"] = round(max(0.0, min(1.0, analysis["consistency_score"])), 2)
+
+        return analysis
+
+    def _analyze_time_inconsistencies(self, metadata):
+        issues = []
+
+        time_data = {}
+        time_keys = [
+            ('EXIF DateTimeOriginal', 'original'),
+            ('EXIF CreateDate', 'creation'),
+            ('EXIF ModifyDate', 'modification'),
+            ('Image DateTime', 'file_modification')
+        ]
+
+        for key, name in time_keys:
+            if key in metadata and metadata[key]:
+                try:
+                    dt_str = str(metadata[key])
+                    dt = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
+                    time_data[name] = dt
+                except:
+                    pass
+
+        if len(time_data) >= 2:
+            times = list(time_data.values())
+            time_diff = max(times) - min(times)
+
+            if time_diff > timedelta(days=365):
+                issues.append(f"Time discrepancy > 1 year")
+            elif time_diff > timedelta(days=30):
+                issues.append(f"Time discrepancy > 30 days")
+
+        return issues
+
+    def _analyze_device_inconsistencies(self, metadata):
+        issues = []
+
+        make = str(metadata.get('EXIF Make', '')).lower().strip()
+        model = str(metadata.get('EXIF Model', '')).lower().strip()
+
+        if not make or not model:
+            return issues
+
+        brand_found = False
+        for brand, patterns in self.camera_brand_patterns.items():
+            if brand in make:
+                brand_found = True
+                if not any(pattern in model for pattern in patterns):
+                    issues.append("Device model inconsistency")
+                break
+
+        if not brand_found and len(make) > 2:
+            issues.append("Unknown camera brand")
+
+        return issues
+
+    def _format_bytes(self, bytes_num):
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if bytes_num < 1024.0 or unit == 'GB':
+                return f"{bytes_num:.2f} {unit}"
+            bytes_num /= 1024.0
+        return f"{bytes_num:.2f} TB"
+
+class AIDetectionAnalyzer:
+    def __init__(self):
+        self.BLOCK_SIZE = 8
+        self.T_BLOCKS = 64
+        self.LAPLACIAN = np.array([
+            [0, 1, 0],
+            [1, -4, 1],
+            [0, 1, 0]
+        ])
+
+    def analyze_noise_correlation(self, image_path):
+        img = cv2.imread(image_path)
+        if img is None:
+            return None
+
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+        Y, Cr, Cb = cv2.split(img)
+
+        channels = {
+            "Y": Y,
+            "Cb": Cb,
+            "Cr": Cr
+        }
+
+        correlation_results = {}
+
+        for name, channel in channels.items():
+            noise = cv2.filter2D(channel.astype(np.float32), -1, self.LAPLACIAN)
+
+            h, w = noise.shape
+            h_trim = h - (h % self.BLOCK_SIZE)
+            w_trim = w - (w % self.BLOCK_SIZE)
+            noise = noise[:h_trim, :w_trim]
+
+            blocks = view_as_blocks(noise, block_shape=(self.BLOCK_SIZE, self.BLOCK_SIZE))
+            blocks = blocks.reshape(-1, self.BLOCK_SIZE * self.BLOCK_SIZE)
+
+            means = np.mean(blocks, axis=1)
+            variances = np.var(blocks, axis=1)
+
+            idx_mean = np.argsort(np.abs(means))[:self.T_BLOCKS]
+            idx_var = np.argsort(variances)[:self.T_BLOCKS]
+
+            selected_idx = np.unique(np.concatenate([idx_mean, idx_var]))
+            selected_blocks = blocks[selected_idx]
+
+            if selected_blocks.shape[0] < self.T_BLOCKS:
+                selected_blocks = blocks[np.argsort(variances)[:self.T_BLOCKS]]
+
+            corr_matrix = np.corrcoef(selected_blocks, rowvar=False)
+            corr_matrix = np.nan_to_num(corr_matrix)
+
+            correlation_results[name] = corr_matrix
+
+        return correlation_results
+
+    def visualize_results(self, correlation_results):
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+        fig.suptitle("Noise Correlation Matrices (Y / Cb / Cr)", fontsize=14)
+
+        for idx, (name, corr_matrix) in enumerate(correlation_results.items()):
+            ax = axes[idx]
+            im = ax.imshow(corr_matrix, cmap="hot")
+            ax.set_title(f"{name} Channel")
+            ax.axis("off")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+        plt.show()
 
 class AdvancedImageTimelineAnalyzer:
     def __init__(self):
@@ -215,24 +638,6 @@ class AdvancedImageTimelineAnalyzer:
             self.best_guess_date = ""
             self.camera_info = {}
             self.gps_info = {}
-
-        def get_file_name(self):
-            return self.file_name
-
-        def get_date_time_results(self):
-            return self.date_time_results
-
-        def get_file_system_dates(self):
-            return self.file_system_dates
-
-        def get_exif_dates(self):
-            return self.exif_dates
-
-        def get_best_guess_date(self):
-            return self.best_guess_date
-
-        def set_best_guess_date(self, best_guess_date):
-            self.best_guess_date = best_guess_date
 
     def analyze_image(self, image_path):
         result = self.ImageAnalysisResult(os.path.basename(image_path))
@@ -343,9 +748,9 @@ class AdvancedImageTimelineAnalyzer:
         for date_type in priority_order:
             date_value = self.find_date_in_sources(date_type, result)
             if date_value:
-                result.set_best_guess_date(f"{date_value} ({date_type})")
+                result.best_guess_date = f"{date_value} ({date_type})"
                 return
-        result.set_best_guess_date("No reliable date found")
+        result.best_guess_date = "No reliable date found"
 
     def find_date_in_sources(self, date_type, result):
         if date_type in result.exif_dates:
@@ -384,7 +789,7 @@ class AdvancedImageTimelineAnalyzer:
 class PicForensicsApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("PicForensics Professional")
+        self.root.title("PicForensics")
         self.root.geometry("800x600")
         self.root.configure(bg="#e3f2fd")
 
@@ -392,10 +797,37 @@ class PicForensicsApp:
         self.image_label = None
         self.uploaded_images = []
         self.current_image_index = -1
-        self.ai_detector = CombinedAIDetectorMinimal()
+        self.current_case_folder = None
+        self.current_case_id = None
+        self.current_case_name = None
+        self.temp_images = {}
         self.timeline_analyzer = AdvancedImageTimelineAnalyzer()
+        self.metadata_extractor = AdvancedMetadataExtractor(enable_cache=True, enable_geocoding=True)
+        self.ai_detector = AIDetectionAnalyzer()
+        self.case_config_file = "cases.json"
+        self.cases = self.load_cases()
+        self.image_source_paths = {}
+        self.encryption_status = {}
+        self.case_passwords = {}
+
+        self.action_buttons_frame = None
+        self.open_btn = None
+        self.delete_btn = None
+        self.encrypt_btn = None
+        self.delete_case_btn = None
 
         self.create_widgets()
+        self.hide_action_buttons()
+
+    def load_cases(self):
+        if os.path.exists(self.case_config_file):
+            with open(self.case_config_file, 'r') as f:
+                return json.load(f)
+        return {}
+
+    def save_cases(self):
+        with open(self.case_config_file, 'w') as f:
+            json.dump(self.cases, f)
 
     def create_widgets(self):
         nav_frame = tk.Frame(self.root, bg="#1976d2", height=40)
@@ -427,7 +859,7 @@ class PicForensicsApp:
         self.image_frame.pack_propagate(False)
 
         self.image_placeholder = tk.Label(self.image_frame,
-                                          text="No Image Loaded\nClick 'Open New Image' to load an image",
+                                          text="No Case Open\nClick 'Open/Create Case' to start",
                                           fg="gray", font=("Arial", 10), bg='white')
         self.image_placeholder.pack(expand=True)
 
@@ -446,7 +878,11 @@ class PicForensicsApp:
                                     state="disabled", bg="#ff9800", fg="white", font=("Arial", 9))
         self.verify_btn.pack(side=tk.LEFT, padx=5)
 
-        self.image_counter = tk.Label(self.navigation_frame, text="No images", bg="#e3f2fd", font=("Arial", 9))
+        self.hash_btn = tk.Button(self.navigation_frame, text="Hash Check", command=self.hash_compare_integrity,
+                                  state="disabled", bg="#9c27b0", fg="white", font=("Arial", 9))
+        #self.hash_btn.pack(side=tk.LEFT, padx=5)
+
+        self.image_counter = tk.Label(self.navigation_frame, text="No case open", bg="#e3f2fd", font=("Arial", 9))
         self.image_counter.pack(side=tk.LEFT, padx=10)
 
         self.info_frame = tk.LabelFrame(left_frame, text="Image Info", padx=10, pady=10,
@@ -482,9 +918,12 @@ class PicForensicsApp:
 
         analysis_dropdown = tk.Menu(analysis_menu, tearoff=0)
         analysis_dropdown.add_command(label="Meta Data", command=self.meta_data_analysis)
+        analysis_dropdown.add_separator()
         analysis_dropdown.add_command(label="Time line", command=self.timeline_analysis)
+        analysis_dropdown.add_separator()
         analysis_dropdown.add_command(label="AI detection", command=self.ai_detection_analysis)
-
+        analysis_dropdown.add_separator()
+        analysis_dropdown.add_command(label="Hash Check", command=self.hash_compare_integrity)
         analysis_menu.configure(menu=analysis_dropdown)
 
         self.tools_var = tk.StringVar(value="Analysis Tools ▼")
@@ -495,7 +934,9 @@ class PicForensicsApp:
 
         tools_dropdown = tk.Menu(tools_menu, tearoff=0)
         tools_dropdown.add_command(label="ELA", command=self.ela_analysis)
+        tools_dropdown.add_separator()
         tools_dropdown.add_command(label="Noise", command=self.noise_analysis)
+        tools_dropdown.add_separator()
         tools_dropdown.add_command(label="Histogram", command=self.histogram_analysis)
 
         tools_menu.configure(menu=tools_dropdown)
@@ -503,21 +944,55 @@ class PicForensicsApp:
         spacer = tk.Frame(tools_frame, height=20, bg="#e3f2fd")
         spacer.pack(fill=tk.X)
 
-        img_btn_frame = tk.Frame(main_content, bg="#e3f2fd")
-        img_btn_frame.pack(pady=10)
+        self.case_btn = tk.Button(main_content, text="Open/Create Case", command=self.manage_case,
+                                  bg="#4CAF50", fg="white", font=("Arial", 10),
+                                  relief=tk.RAISED, bd=2)
+        self.case_btn.pack(pady=5)
 
-        open_btn = tk.Button(img_btn_frame, text="Open New Image", command=self.open_image,
-                             bg="#2196f3", fg="white", font=("Arial", 10),
-                             relief=tk.RAISED, bd=2)
-        open_btn.pack(side=tk.LEFT, padx=5)
+        self.open_old_btn = tk.Button(main_content, text="Open Old Case", command=self.open_old_case,
+                                      bg="#2196f3", fg="white", font=("Arial", 10),
+                                      relief=tk.RAISED, bd=2)
+        self.open_old_btn.pack(pady=5)
 
-        delete_btn = tk.Button(img_btn_frame, text="Delete Image", command=self.delete_image,
-                               bg="#2196f3", fg="white", font=("Arial", 10),
-                               relief=tk.RAISED, bd=2)
-        delete_btn.pack(side=tk.LEFT, padx=5)
+        self.action_buttons_frame = tk.Frame(main_content, bg="#e3f2fd")
+        self.action_buttons_frame.pack(pady=10)
+
+    def hide_action_buttons(self):
+        for widget in self.action_buttons_frame.winfo_children():
+            widget.destroy()
+
+    def show_action_buttons(self):
+        self.hide_action_buttons()
+
+        self.open_btn = tk.Button(self.action_buttons_frame, text="Upload Folder", command=self.open_folder,
+                                  bg="#2196f3", fg="white", font=("Arial", 10),
+                                  relief=tk.RAISED, bd=2)
+        self.open_btn.pack(side=tk.LEFT, padx=5)
+
+        self.delete_btn = tk.Button(self.action_buttons_frame, text="Delete Image", command=self.delete_image,
+                                    bg="#2196f3", fg="white", font=("Arial", 10),
+                                    relief=tk.RAISED, bd=2)
+        self.delete_btn.pack(side=tk.LEFT, padx=5)
+
+        self.encrypt_btn = tk.Button(self.action_buttons_frame, text="Encrypt/Decrypt",
+                                     command=self.encrypt_decrypt_menu,
+                                     bg="#FF5722", fg="white", font=("Arial", 10),
+                                     relief=tk.RAISED, bd=2)
+        self.encrypt_btn.pack(side=tk.LEFT, padx=5)
+
+        self.case_hash_btn = tk.Button(self.action_buttons_frame, text="Case Hash", command=self.case_hash_integrity,
+                                       bg="#673ab7", fg="white", font=("Arial", 10),
+                                       relief=tk.RAISED, bd=2)
+        self.case_hash_btn.pack(side=tk.LEFT, padx=5)
+
+        self.delete_case_btn = tk.Button(self.action_buttons_frame, text="Delete Case", command=self.delete_case,
+                                         bg="#f44336", fg="white", font=("Arial", 10),
+                                         relief=tk.RAISED, bd=2)
+        self.delete_case_btn.pack(side=tk.LEFT, padx=5)
 
     def nav_action(self, item):
         if item == "Exit":
+            self.cleanup_temp_files()
             self.root.quit()
         elif item == "HOME":
             self.show_home_dashboard()
@@ -526,24 +1001,39 @@ class PicForensicsApp:
         elif item == "Help":
             self.show_help_info()
 
+    def cleanup_temp_files(self):
+        for temp_path in self.temp_images.values():
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except:
+                pass
+        self.temp_images.clear()
+
     def show_home_dashboard(self):
         home_window = tk.Toplevel(self.root)
         home_window.title("PicForensics - Dashboard")
         home_window.geometry("600x400")
         home_window.configure(bg="#f5f5f5")
 
-        header = tk.Label(home_window, text="📷 PicForensics Professional",
+        header = tk.Label(home_window, text="📷 PicForensics",
                           font=("Arial", 16, "bold"), bg="#f5f5f5", fg="#1976d2")
         header.pack(pady=20)
 
         stats_frame = tk.Frame(home_window, bg="#f5f5f5")
         stats_frame.pack(pady=10)
 
+        current_case = f"{self.current_case_name} ({self.current_case_id})" if self.current_case_name else "None"
+        encrypted_count = sum(1 for img in self.uploaded_images if img.endswith('.enc'))
+        decrypted_count = len(self.uploaded_images) - encrypted_count
+
         stats = [
-            f"📁 Loaded Images: {len(self.uploaded_images)}",
-            f"🔍 Current Analysis: {os.path.basename(self.current_image) if self.current_image else 'None'}",
-            f"🛠️ Tools Available: 6 Analysis Methods",
-            f"📊 Last Result: {getattr(self, 'last_ai_result', 'No analysis yet')}"
+            f"📁 Current Case: {current_case}",
+            f"📷 Total Images: {len(self.uploaded_images)}",
+            f"🔒 Encrypted Images: {encrypted_count}",
+            f"🔓 Decrypted Images: {decrypted_count}",
+            f"🛠️ Tools Available: 5 Analysis Methods",
+            f"📊 Cases Saved: {len(self.cases)}"
         ]
 
         for stat in stats:
@@ -551,70 +1041,52 @@ class PicForensicsApp:
                            bg="#f5f5f5", fg="#333")
             lbl.pack(pady=5)
 
-        quick_actions = tk.Frame(home_window, bg="#f5f5f5")
-        quick_actions.pack(pady=20)
-
-        action_btn = tk.Button(quick_actions, text="Quick Integrity Check",
-                               command=self.quick_integrity_check,
-                               bg="#4caf50", fg="white", font=("Arial", 10))
-        action_btn.pack(side=tk.LEFT, padx=10)
-
         close_btn = tk.Button(home_window, text="Close Dashboard",
                               command=home_window.destroy,
                               bg="#2196f3", fg="white", font=("Arial", 10))
         close_btn.pack(pady=10)
 
-    def quick_integrity_check(self):
-        if not self.current_image:
-            messagebox.showwarning("No Image", "Please load an image first!")
-            return
-
-        try:
-            result = self.ai_detector.analyze(self.current_image)
-            messagebox.showinfo("Quick Integrity Check",
-                                f"AI Probability: {result['ai_probability']}\n"
-                                f"Confidence: {result['confidence']}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Quick check failed: {str(e)}")
-
     def show_about_info(self):
-        about_text = """PicForensics Professional
+        about_text = """PicForensics
 
-Version: 3.0 Enhanced
-Advanced Image Forensics Tool
+Version: 5.0 with Complete Encryption System
+Advanced Image Forensics & Security Tool
 
 Features:
-• Combined AI Detection with Multiple Models
-• Comprehensive Metadata Analysis
-• Advanced Timeline Reconstruction
-• Professional Integrity Verification
+• Case-based management with full encryption
+• Images encrypted both in tool and source location
+• Cannot view encrypted images without password
+• Decryption restores images in both locations
+• AES-128 Secure Image Encryption
+• Advanced Metadata Extraction with exifread
+• AI Detection using Noise Correlation Analysis
+• Hash Detection using SHA - 256"""
 
-Technology Stack:
-• PyTorch & EfficientNet Models
-• OpenCV Image Processing
-• Advanced EXIF Analysis
-• Machine Learning Ensemble"""
         messagebox.showinfo("About PicForensics", about_text)
 
     def show_help_info(self):
         help_text = """PicForensics Help Guide
 
-Basic Operations:
-• Open New Image: Load single or multiple images
-• Navigation: Use Previous/Next buttons
-• Verify Integrity: Comprehensive authenticity check
+Complete Encryption System:
+• Encrypt Current Image: Encrypts image in tool AND original location
+• Decrypt for Analysis: Temporary decryption for analysis only
+• Encrypt Entire Folder: Encrypts all images in source folder
+• Decrypt All: Permanently decrypts all images in case
 
-Analysis Tools:
-• ELA: Error Level Analysis
-• Noise: Pattern analysis
-• Histogram: Color distribution
+New Features:
+• Advanced Metadata Extraction using exifread library
+• AI Detection using Noise Correlation Analysis
+• Forensic analysis with consistency scoring
+• GPS geocoding and reverse geolocation
 
-Analysis Results:
-• Meta Data: EXIF and file information
-• Time Line: Creation and modification dates
-• AI Detection: AI-generated image detection
+Security Features:
+• Images encrypted in both tool AND source location
+• Cannot view encrypted images without password
+• When opening old case: encrypted images remain encrypted
+• Decryption restores images in both locations
+• No images visible until decrypted
+• Hash Detection """
 
-Professional forensic analysis tool"""
         messagebox.showinfo("Help Guide", help_text)
 
     def verify_integrity(self):
@@ -623,36 +1095,33 @@ Professional forensic analysis tool"""
             return
 
         try:
+            if self.current_image.endswith('.enc'):
+                if self.current_image not in self.temp_images:
+                    messagebox.showwarning("Encrypted Image", "Please decrypt the image for analysis first!")
+                    return
+                image_to_check = self.temp_images[self.current_image]
+            else:
+                image_to_check = self.current_image
+
             integrity_report = "Integrity Verification Report\n\n"
 
-            file_size = os.path.getsize(self.current_image) / (1024 * 1024)
+            file_size = os.path.getsize(image_to_check) / (1024 * 1024)
             integrity_report += f"File Size: {file_size:.2f} MB\n"
 
-            image = Image.open(self.current_image)
+            image = Image.open(image_to_check)
             integrity_report += f"Dimensions: {image.width} x {image.height}\n"
             integrity_report += f"Format: {image.format}\n\n"
 
-            timeline_result = self.timeline_analyzer.analyze_image(self.current_image)
-            integrity_report += f"Best Guess Date: {timeline_result.best_guess_date}\n\n"
+            timeline_result = self.timeline_analyzer.analyze_image(image_to_check)
+            integrity_report += f"Best Guess Date: {timeline_result.best_guess_date}\n"
 
-            ai_result = self.ai_detector.analyze(self.current_image)
-            ai_prob = ai_result['ai_probability']
-            confidence = ai_result['confidence']
-
-            integrity_report += f"AI Detection: {ai_prob:.1%}\n"
-            integrity_report += f"Confidence: {confidence}\n\n"
-
-            if ai_prob > 0.7:
-                integrity_report += "WARNING: High probability of AI generation\n"
-            elif ai_prob > 0.5:
-                integrity_report += "NOTE: Possible AI involvement\n"
-            else:
-                integrity_report += "Likely authentic image\n"
+            if self.current_image.endswith('.enc'):
+                integrity_report += "\n⚠️ NOTE: This is a decrypted temporary copy\n"
+                integrity_report += "Original file remains encrypted (.enc)\n"
 
             if file_size < 0.1 and image.width * image.height > 1000000:
-                integrity_report += "WARNING: High resolution with small file size\n"
+                integrity_report += "\nWARNING: High resolution with small file size\n"
 
-            self.last_ai_result = f"{ai_prob:.1%} ({confidence})"
             messagebox.showinfo("Integrity Verification", integrity_report)
 
         except Exception as e:
@@ -669,9 +1138,11 @@ Professional forensic analysis tool"""
         if self.uploaded_images:
             self.image_counter.config(text=f"Image {self.current_image_index + 1} of {len(self.uploaded_images)}")
             self.verify_btn.config(state="normal")
+            self.hash_btn.config(state="normal")
         else:
-            self.image_counter.config(text="No images")
+            self.image_counter.config(text="No images in case")
             self.verify_btn.config(state="disabled")
+            self.hash_btn.config(state="disabled")
 
     def previous_image(self):
         if self.uploaded_images and self.current_image_index > 0:
@@ -683,12 +1154,923 @@ Professional forensic analysis tool"""
             self.current_image_index += 1
             self.load_current_image()
 
+        # ─────────────────────────── Hash Features ───────────────────────────
+
+    def _hash_registry_file(self) -> str | None:
+        if not self.current_case_folder:
+            return None
+        return os.path.join(self.current_case_folder, "hash_registry.json")
+
+    def auto_save_hash_for_current_image(self, show_popup: bool = False):
+
+        try:
+            if not getattr(self, "current_image", None) or not getattr(self, "current_case_folder", None):
+                return
+
+            registry_file = self._hash_registry_file()
+            if not registry_file:
+                return
+
+            origin_path = self.image_source_paths.get(self.current_image, self.current_image)
+            key = f"IMG::{origin_path}"
+
+            file_to_hash = self.current_image
+            if self.current_image.endswith(".enc"):
+                if self.current_image not in self.temp_images or not os.path.exists(
+                        self.temp_images[self.current_image]):
+                    return
+                file_to_hash = self.temp_images[self.current_image]
+
+            if not os.path.exists(file_to_hash):
+                return
+
+            new_hash = compute_image_hash(file_to_hash)
+            old_hash = get_previous_hash(registry_file, key)
+            state = compare_hashes(old_hash, new_hash)
+
+            if state == "FIRST":
+                save_hash_to_registry(
+                    registry_file,
+                    key,
+                    new_hash,
+                    meta={
+                        "type": "image",
+                        "origin_path": origin_path,
+                        "case_id": getattr(self, "current_case_id", None),
+                        "case_name": getattr(self, "current_case_name", None),
+                    },
+                )
+                if show_popup:
+                    self.show_analysis_results(
+                        "Hash Auto Check",
+                        f"🟡 First time.\nBaseline hash saved.\n\nHASH:\n{new_hash}",
+                    )
+                return
+
+            if state == "MATCH":
+                if show_popup:
+                    self.show_analysis_results(
+                        "Hash Auto Check",
+                        f"🟢 MATCH — No tampering detected.\n\nHASH:\n{new_hash}",
+                    )
+                return
+
+            # MODIFIED
+            if show_popup:
+                self.show_analysis_results(
+                    "Hash Auto Check",
+                    "🔴 MODIFIED — Hash mismatch detected.\n\n"
+                    f"OLD (baseline) → {old_hash}\n"
+                    f"NEW (current)  → {new_hash}",
+                )
+        except Exception:
+            return
+
+    def hash_compare_integrity(self):
+
+        if not getattr(self, "current_image", None):
+            messagebox.showwarning("No Image Loaded", "⚠ Please open an image first.")
+            return
+
+        if not getattr(self, "current_case_folder", None):
+            messagebox.showwarning("No Case", "⚠ Please open/create a case first.")
+            return
+
+        registry_file = self._hash_registry_file()
+        if not registry_file:
+            messagebox.showwarning("No Registry", "⚠ Hash registry file not available.")
+            return
+
+        origin_path = self.image_source_paths.get(self.current_image, self.current_image)
+        key = f"IMG::{origin_path}"
+
+        file_to_hash = self.current_image
+        if self.current_image.endswith(".enc"):
+            if self.current_image not in self.temp_images or not os.path.exists(self.temp_images[self.current_image]):
+                messagebox.showwarning(
+                    "Encrypted Image",
+                    "⚠ This is an encrypted file.\nDecrypt for analysis first, then run Hash Check.",
+                )
+                return
+            file_to_hash = self.temp_images[self.current_image]
+
+        if not os.path.exists(file_to_hash):
+            messagebox.showwarning("Missing File", "⚠ Image file not found on disk.")
+            return
+
+        new_hash = compute_image_hash(file_to_hash)
+        old_hash = get_previous_hash(registry_file, key)
+        state = compare_hashes(old_hash, new_hash)
+
+        if state == "FIRST":
+            save_hash_to_registry(
+                registry_file,
+                key,
+                new_hash,
+                meta={
+                    "type": "image",
+                    "origin_path": origin_path,
+                    "case_id": getattr(self, "current_case_id", None),
+                    "case_name": getattr(self, "current_case_name", None),
+                },
+            )
+            self.show_analysis_results(
+                "Hash Integrity Result",
+                f"🟡 No previous hash found for this image.\n"
+                f"A baseline hash has now been saved.\n\n"
+                f"NEW HASH:\n{new_hash}",
+            )
+        elif state == "MATCH":
+            self.show_analysis_results(
+                "Hash Integrity Result",
+                f"🟢 Image is ORIGINAL — No tampering detected.\n\nHASH MATCH:\n{new_hash}",
+            )
+        else:
+            self.show_analysis_results(
+                "Hash Integrity Result",
+                f"🔴 HASH MISMATCH — File appears modified.\n\n"
+                f"OLD → {old_hash}\n"
+                f"NEW → {new_hash}",
+            )
+
+    def case_hash_integrity(self):
+        if not self.current_case_folder or not self.uploaded_images:
+            messagebox.showwarning("No Case", "⚠ Open a case and upload images first.")
+            return
+
+        registry_file = self._hash_registry_file()
+        if not registry_file:
+            messagebox.showwarning("No Registry", "⚠ Hash registry file not available.")
+            return
+
+        key = f"CASE::{getattr(self, 'current_case_id', self.current_case_folder)}"
+
+        current_case_hash = compute_case_hash([p for p in self.uploaded_images if os.path.exists(p)])
+        old_case_hash = get_previous_hash(registry_file, key)
+        state = compare_hashes(old_case_hash, current_case_hash)
+
+        if state == "FIRST":
+            save_hash_to_registry(
+                registry_file,
+                key,
+                current_case_hash,
+                meta={
+                    "type": "case",
+                    "case_id": getattr(self, "current_case_id", None),
+                    "case_name": getattr(self, "current_case_name", None),
+                    "image_count": len(self.uploaded_images),
+                },
+            )
+            msg = (
+                "🟡 No previous CASE hash found.\n"
+                "A baseline CASE hash has now been saved.\n\n"
+                f"CASE HASH:\n{current_case_hash}"
+            )
+            self.show_analysis_results("Case Hash Result", msg)
+
+        elif state == "MATCH":
+            msg = f"🟢 CASE OK — No changes detected.\n\nCASE HASH:\n{current_case_hash}"
+            self.show_analysis_results("Case Hash Result", msg)
+
+        else:
+            msg = (
+                "🔴 CASE HASH MISMATCH — case contents changed.\n\n"
+                f"OLD → {old_case_hash}\n"
+                f"NEW → {current_case_hash}"
+            )
+            self.show_analysis_results("Case Hash Result", msg)
+
     def load_current_image(self):
         if 0 <= self.current_image_index < len(self.uploaded_images):
             image_path = self.uploaded_images[self.current_image_index]
-            self.load_and_display_image(image_path)
-            self.update_image_info(image_path)
+
+            if image_path.endswith('.enc'):
+                self.current_image = image_path
+                self.update_image_info(image_path)
+                self.image_placeholder.config(
+                    text="🔒 ENCRYPTED IMAGE\n\nCannot be viewed without decryption\n\nClick 'Decrypt for Analysis' to view\nClick 'Decrypt All' to restore all images")
+                self.image_placeholder.pack(expand=True)
+                if self.image_label:
+                    self.image_label.destroy()
+                    self.image_label = None
+            else:
+                self.load_and_display_image(image_path)
+                self.update_image_info(image_path)
+            self.auto_save_hash_for_current_image()
             self.update_navigation_buttons()
+
+    def load_and_display_image(self, file_path, set_current=True):
+        if set_current:
+            self.current_image = file_path
+
+        self.image_placeholder.pack_forget()
+        try:
+            image = Image.open(file_path)
+            frame_width = 380
+            frame_height = 280
+            image.thumbnail((frame_width, frame_height), Image.Resampling.LANCZOS)
+            photo = ImageTk.PhotoImage(image)
+            if self.image_label:
+                self.image_label.destroy()
+            self.image_label = tk.Label(self.image_frame, image=photo, bg='white')
+            self.image_label.image = photo
+            self.image_label.pack(expand=True)
+            self.current_image = file_path
+        except Exception as e:
+            self.image_placeholder.config(text="Cannot display image\nFile may be corrupted")
+            self.image_placeholder.pack(expand=True)
+            self.current_image = file_path
+
+    def update_image_info(self, file_path):
+        try:
+            file_size = os.path.getsize(file_path) / (1024 * 1024)
+            file_name = os.path.basename(file_path)
+            if file_path.endswith('.enc'):
+                file_ext = "ENCRYPTED (.enc)"
+                display_name = file_name
+            else:
+                file_ext = os.path.splitext(file_name)[1].upper().replace(".", "")
+                display_name = file_name
+            self.info_labels["File Size"].config(text=f"{file_size:.2f}MB")
+            self.info_labels["File Format"].config(text=file_ext)
+            self.info_labels["File Path"].config(text=display_name)
+        except Exception as e:
+            pass
+
+    def open_folder(self):
+        folder_path = filedialog.askdirectory(title="Select Folder with Images")
+        if folder_path:
+            image_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif')
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    if file.lower().endswith(image_extensions):
+                        src_path = os.path.join(root, file)
+                        dest_path = os.path.join(self.current_case_folder, file)
+
+                        shutil.copy2(src_path, dest_path)
+
+                        self.image_source_paths[dest_path] = src_path
+                        self.uploaded_images.append(dest_path)
+                        self.encryption_status[dest_path] = False
+
+            for root, dirs, files in os.walk(folder_path):
+                for file in files:
+                    if file.lower().endswith('.enc'):
+                        src_path = os.path.join(root, file)
+                        dest_path = os.path.join(self.current_case_folder, file)
+
+                        shutil.copy2(src_path, dest_path)
+
+                        self.image_source_paths[dest_path] = src_path
+                        self.uploaded_images.append(dest_path)
+                        self.encryption_status[dest_path] = True
+
+            if self.uploaded_images:
+                self.current_image_index = 0
+                self.load_current_image()
+            else:
+                messagebox.showinfo("No Images", "No images found in the selected folder")
+
+            self.save_case_state()
+
+    def delete_image(self):
+        if not self.current_image:
+            messagebox.showwarning("Delete Image", "No image to delete!")
+            return
+
+        image_path = self.uploaded_images[self.current_image_index]
+        is_encrypted = image_path.endswith('.enc')
+
+        warning_msg = "Are you sure you want to delete this image from the case?"
+        if is_encrypted:
+            warning_msg += "\n\n⚠️ This is an encrypted image (.enc)\nIt cannot be recovered once deleted!"
+
+        result = messagebox.askyesno("Delete Image", warning_msg)
+
+        if result:
+            if 0 <= self.current_image_index < len(self.uploaded_images):
+                try:
+                    os.remove(self.uploaded_images[self.current_image_index])
+                except:
+                    pass
+                self.uploaded_images.pop(self.current_image_index)
+                if self.uploaded_images:
+                    if self.current_image_index >= len(self.uploaded_images):
+                        self.current_image_index = len(self.uploaded_images) - 1
+                    self.load_current_image()
+                else:
+                    if self.image_label:
+                        self.image_label.destroy()
+                        self.image_label = None
+                    self.image_placeholder.config(text="No images in case\nUpload folder to add images")
+                    self.image_placeholder.pack(expand=True)
+                    for key in self.info_labels:
+                        self.info_labels[key].config(text="No image loaded")
+                    self.current_image = None
+                    self.current_image_index = -1
+                    self.update_navigation_buttons()
+                self.save_case_state()
+                messagebox.showinfo("Delete Image", "Image deleted successfully!")
+
+    def manage_case(self):
+        case_window = tk.Toplevel(self.root)
+        case_window.title("Create/Open Case")
+        case_window.geometry("400x300")
+        case_window.configure(bg="#f5f5f5")
+
+        tk.Label(case_window, text="Case Management", font=("Arial", 14, "bold"),
+                 bg="#f5f5f5", fg="#1976d2").pack(pady=20)
+
+        tk.Label(case_window, text="Case ID:", bg="#f5f5f5").pack(pady=5)
+        case_id_entry = tk.Entry(case_window, width=30)
+        case_id_entry.pack(pady=5)
+
+        tk.Label(case_window, text="Case Name:", bg="#f5f5f5").pack(pady=5)
+        case_name_entry = tk.Entry(case_window, width=30)
+        case_name_entry.pack(pady=5)
+
+        def create_open_case():
+            case_id = case_id_entry.get().strip()
+            case_name = case_name_entry.get().strip()
+
+            if not case_id or not case_name:
+                messagebox.showwarning("Input Error", "Please enter both Case ID and Case Name")
+                return
+
+            case_folder = f"Case_{case_id}_{case_name}"
+            if not os.path.exists(case_folder):
+                os.makedirs(case_folder)
+
+            self.current_case_folder = case_folder
+            self.current_case_id = case_id
+            self.current_case_name = case_name
+
+            self.cases[case_id] = {
+                "name": case_name,
+                "folder": case_folder,
+                "images": []
+            }
+            self.save_cases()
+
+            self.uploaded_images = []
+            self.image_source_paths = {}
+            self.encryption_status = {}
+
+            for file in os.listdir(case_folder):
+                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.enc')):
+                    file_path = os.path.join(case_folder, file)
+                    self.uploaded_images.append(file_path)
+                    if file.endswith('.enc'):
+                        self.encryption_status[file_path] = True
+
+            self.current_image_index = 0 if self.uploaded_images else -1
+            self.cleanup_temp_files()
+
+            if self.uploaded_images:
+                self.load_current_image()
+            else:
+                self.image_placeholder.config(text="Case Created\nUpload folder to add images")
+
+            self.show_action_buttons()
+            self.update_navigation_buttons()
+
+            case_window.destroy()
+            messagebox.showinfo("Success", f"Case '{case_name}' created successfully!")
+
+        tk.Button(case_window, text="Create/Open Case", command=create_open_case,
+                  bg="#4CAF50", fg="white", font=("Arial", 10)).pack(pady=20)
+
+        tk.Button(case_window, text="Cancel", command=case_window.destroy,
+                  bg="#f44336", fg="white", font=("Arial", 10)).pack(pady=5)
+
+    def open_old_case(self):
+        if not self.cases:
+            messagebox.showinfo("No Cases", "No previous cases found.")
+            return
+
+        case_window = tk.Toplevel(self.root)
+        case_window.title("Open Old Case")
+        case_window.geometry("500x400")
+        case_window.configure(bg="#f5f5f5")
+
+        tk.Label(case_window, text="Select Case to Open", font=("Arial", 14, "bold"),
+                 bg="#f5f5f5", fg="#1976d2").pack(pady=20)
+
+        list_frame = tk.Frame(case_window, bg="#f5f5f5")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        scrollbar = tk.Scrollbar(list_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        case_list = tk.Listbox(list_frame, yscrollcommand=scrollbar.set,
+                               font=("Arial", 11), height=10)
+        case_list.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=case_list.yview)
+
+        for case_id, case_info in self.cases.items():
+            case_list.insert(tk.END, f"{case_id}: {case_info['name']}")
+
+        def open_selected_case():
+            selection = case_list.curselection()
+            if not selection:
+                messagebox.showwarning("No Selection", "Please select a case")
+                return
+
+            selected_item = case_list.get(selection[0])
+            case_id = selected_item.split(":")[0].strip()
+
+            if case_id in self.cases:
+                case_info = self.cases[case_id]
+                self.current_case_folder = case_info["folder"]
+                self.current_case_id = case_id
+                self.current_case_name = case_info["name"]
+
+                self.uploaded_images = []
+                self.image_source_paths = {}
+                self.encryption_status = {}
+
+                for file in os.listdir(self.current_case_folder):
+                    if file.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.enc')):
+                        file_path = os.path.join(self.current_case_folder, file)
+                        self.uploaded_images.append(file_path)
+                        if file.endswith('.enc'):
+                            self.encryption_status[file_path] = True
+
+                self.current_image_index = 0 if self.uploaded_images else -1
+                self.cleanup_temp_files()
+
+                if self.uploaded_images:
+                    self.load_current_image()
+                else:
+                    self.image_placeholder.config(text="Case Loaded\nNo images in case")
+                    if self.image_label:
+                        self.image_label.destroy()
+                        self.image_label = None
+
+                self.show_action_buttons()
+                self.update_navigation_buttons()
+
+                case_window.destroy()
+                messagebox.showinfo("Success",
+                                    f"Case '{case_info['name']}' loaded successfully!\n\nEncrypted images remain encrypted until decrypted.")
+
+        btn_frame = tk.Frame(case_window, bg="#f5f5f5")
+        btn_frame.pack(fill=tk.X, padx=20, pady=10)
+
+        tk.Button(btn_frame, text="Open Selected Case", command=open_selected_case,
+                  bg="#2196f3", fg="white", font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
+
+        tk.Button(btn_frame, text="Cancel", command=case_window.destroy,
+                  bg="#f44336", fg="white", font=("Arial", 10)).pack(side=tk.RIGHT, padx=5)
+
+    def encrypt_decrypt_menu(self):
+        menu_window = tk.Toplevel(self.root)
+        menu_window.title("Encryption/Decryption")
+        menu_window.geometry("300x300")
+        menu_window.configure(bg="#f5f5f5")
+
+        tk.Label(menu_window, text="Select Operation", font=("Arial", 12, "bold"),
+                 bg="#f5f5f5", fg="#1976d2").pack(pady=20)
+
+        tk.Button(menu_window, text="Encrypt Current Image",
+                  command=lambda: [self.encrypt_current_image(), menu_window.destroy()],
+                  bg="#FF5722", fg="white", font=("Arial", 10), width=20).pack(pady=5)
+
+        tk.Button(menu_window, text="Decrypt for Analysis",
+                  command=lambda: [self.decrypt_for_analysis(), menu_window.destroy()],
+                  bg="#2196f3", fg="white", font=("Arial", 10), width=20).pack(pady=5)
+
+        tk.Button(menu_window, text="Encrypt Entire Folder",
+                  command=lambda: [self.encrypt_entire_folder(), menu_window.destroy()],
+                  bg="#9C27B0", fg="white", font=("Arial", 10), width=20).pack(pady=5)
+
+        tk.Button(menu_window, text="Permanently Decrypt",
+                  command=lambda: [self.permanently_decrypt(), menu_window.destroy()],
+                  bg="#4CAF50", fg="white", font=("Arial", 10), width=20).pack(pady=5)
+
+        tk.Button(menu_window, text="Decrypt All",
+                  command=lambda: [self.decrypt_all_images(), menu_window.destroy()],
+                  bg="#FF9800", fg="white", font=("Arial", 10), width=20).pack(pady=5)
+
+        tk.Button(menu_window, text="Cancel", command=menu_window.destroy,
+                  bg="#95a5a6", fg="white", font=("Arial", 10), width=20).pack(pady=10)
+
+    def encrypt_current_image(self):
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please select an image first!")
+            return
+
+        if self.current_image.endswith('.enc'):
+            messagebox.showwarning("Already Encrypted", "This image is already encrypted!")
+            return
+
+        original_source_path = None
+        for src_path, dest_path in self.image_source_paths.items():
+            if dest_path == self.current_image or os.path.basename(dest_path) == os.path.basename(self.current_image):
+                original_source_path = src_path
+                break
+
+        password = simpledialog.askstring("Encryption Password",
+                                          "Enter password for encryption (min 8 characters):",
+                                          show='•')
+        if password and len(password) >= 8:
+            confirm_password = simpledialog.askstring("Confirm Password",
+                                                      "Confirm password:",
+                                                      show='•')
+            if confirm_password == password:
+                try:
+                    if original_source_path:
+                        with open(original_source_path, "rb") as f:
+                            image_data = f.read()
+
+                        encrypted_data = encrypt_image_data(image_data, password)
+                        if encrypted_data:
+                            enc_source_path = original_source_path + ".enc"
+                            with open(enc_source_path, "wb") as f:
+                                f.write(encrypted_data)
+                                f.flush()
+                                os.fsync(f.fileno())
+
+                            os.remove(original_source_path)
+                            self.image_source_paths[enc_source_path] = enc_source_path
+                            if original_source_path in self.image_source_paths:
+                                del self.image_source_paths[original_source_path]
+
+                    with open(self.current_image, "rb") as f:
+                        image_data = f.read()
+
+                    encrypted_data = encrypt_image_data(image_data, password)
+                    if encrypted_data:
+                        enc_path = self.current_image + ".enc"
+                        with open(enc_path, "wb") as f:
+                            f.write(encrypted_data)
+                            f.flush()
+                            os.fsync(f.fileno())
+
+                        os.remove(self.current_image)
+
+                        original_index = self.current_image_index
+                        self.uploaded_images[original_index] = enc_path
+                        self.encryption_status[enc_path] = True
+                        self.current_image = enc_path
+                        self.load_current_image()
+                        self.save_case_state()
+
+                        self.case_passwords[self.current_case_id] = password
+
+                        messagebox.showinfo("Success",
+                                            "Image encrypted in BOTH locations!\n\n• In tool: Cannot be viewed\n• In source folder: Cannot be opened\n• Requires password to decrypt")
+                    else:
+                        messagebox.showerror("Error", "Encryption failed")
+                except Exception as e:
+                    messagebox.showerror("Error", f"Encryption failed: {str(e)}")
+            else:
+                messagebox.showerror("Error", "Passwords do not match!")
+        elif password:
+            messagebox.showwarning("Weak Password", "Password must be at least 8 characters")
+
+    def decrypt_for_analysis(self):
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please select an image first!")
+            return
+
+        if not self.current_image.endswith('.enc'):
+            messagebox.showwarning("Not Encrypted", "This image is not encrypted!")
+            return
+
+        password = simpledialog.askstring("Decryption Password",
+                                          "Enter password to decrypt image for analysis:",
+                                          show='•')
+        if password:
+            try:
+                with open(self.current_image, "rb") as f:
+                    encrypted_data = f.read()
+
+                decrypted_data = decrypt_image_data(encrypted_data, password)
+                if decrypted_data:
+                    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+                    temp_file.write(decrypted_data)
+                    temp_file.flush()
+                    os.fsync(temp_file.fileno())
+                    temp_file.close()
+
+                    self.temp_images[self.current_image] = temp_file.name
+                    self.load_and_display_image(temp_file.name, set_current=False)
+                    self.update_image_info(self.current_image)
+
+                    messagebox.showinfo("Success",
+                                        "Image decrypted for analysis!\n\n⚠️ Temporary decryption only\nOriginal remains encrypted in both locations")
+                else:
+                    messagebox.showerror("Error", "Wrong password or corrupted file")
+            except Exception as e:
+                messagebox.showerror("Error", f"Decryption failed: {str(e)}")
+
+    def encrypt_entire_folder(self):
+        if not self.image_source_paths:
+            messagebox.showwarning("No Source Folder", "Please upload a folder first!")
+            return
+
+        response = messagebox.askyesno("Encrypt Entire Folder",
+                                       "⚠️ COMPLETE ENCRYPTION WARNING\n\n"
+                                       "This will encrypt ALL images in BOTH locations:\n"
+                                       "1. Inside PicForensics tool\n"
+                                       "2. In original source folder\n\n"
+                                       "Encrypted images cannot be viewed in tool\n"
+                                       "Cannot be opened in source folder\n\n"
+                                       "Continue?")
+        if response:
+            password = simpledialog.askstring("Encryption Password",
+                                              "Enter password for folder encryption (min 8 characters):",
+                                              show='•')
+            if password and len(password) >= 8:
+                confirm_password = simpledialog.askstring("Confirm Password",
+                                                          "Confirm password:",
+                                                          show='•')
+                if confirm_password == password:
+                    encrypted_count = 0
+                    failed_count = 0
+
+                    for src_path in list(self.image_source_paths.keys()):
+                        if not src_path.endswith('.enc'):
+                            try:
+                                with open(src_path, "rb") as f:
+                                    image_data = f.read()
+
+                                encrypted_data = encrypt_image_data(image_data, password)
+                                if encrypted_data:
+                                    enc_source_path = src_path + ".enc"
+                                    with open(enc_source_path, "wb") as f:
+                                        f.write(encrypted_data)
+                                        f.flush()
+                                        os.fsync(f.fileno())
+
+                                    os.remove(src_path)
+                                    self.image_source_paths[enc_source_path] = enc_source_path
+                                    del self.image_source_paths[src_path]
+                                    encrypted_count += 1
+                                else:
+                                    failed_count += 1
+                            except:
+                                failed_count += 1
+
+                    for i, file_path in enumerate(self.uploaded_images[:]):
+                        if not file_path.endswith('.enc'):
+                            try:
+                                with open(file_path, "rb") as f:
+                                    image_data = f.read()
+
+                                encrypted_data = encrypt_image_data(image_data, password)
+                                if encrypted_data:
+                                    enc_path = file_path + ".enc"
+                                    with open(enc_path, "wb") as f:
+                                        f.write(encrypted_data)
+                                        f.flush()
+                                        os.fsync(f.fileno())
+
+                                    os.remove(file_path)
+                                    self.uploaded_images[i] = enc_path
+                                    self.encryption_status[enc_path] = True
+                                    encrypted_count += 1
+                                else:
+                                    failed_count += 1
+                            except:
+                                failed_count += 1
+
+                    if encrypted_count > 0:
+                        self.current_image_index = 0 if self.uploaded_images else -1
+                        if self.uploaded_images:
+                            self.load_current_image()
+                        self.save_case_state()
+
+                        self.case_passwords[self.current_case_id] = password
+
+                        result_msg = f"{encrypted_count} images encrypted in BOTH locations!\n\n"
+                        result_msg += "🔒 INSIDE TOOL:\n• Images cannot be viewed\n• Show as encrypted (.enc)\n• Require password\n\n"
+                        result_msg += "🔒 IN SOURCE FOLDER:\n• Files cannot be opened\n• Show as .enc files\n• Require password"
+
+                        if failed_count > 0:
+                            result_msg += f"\n\n{failed_count} images failed to encrypt"
+
+                        messagebox.showinfo("Complete Encryption", result_msg)
+                    else:
+                        messagebox.showinfo("No Images", "No images were encrypted")
+                else:
+                    messagebox.showerror("Error", "Passwords do not match!")
+            elif password:
+                messagebox.showwarning("Weak Password", "Password must be at least 8 characters")
+
+    def permanently_decrypt(self):
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please select an image first!")
+            return
+
+        if not self.current_image.endswith('.enc'):
+            messagebox.showwarning("Not Encrypted", "This image is not encrypted!")
+            return
+
+        original_source_path = None
+        for src_path in self.image_source_paths:
+            if src_path.endswith('.enc') and os.path.basename(src_path) == os.path.basename(self.current_image):
+                original_source_path = src_path[:-4]
+                break
+
+        password = simpledialog.askstring("Permanent Decryption",
+                                          "Enter password to permanently decrypt image:",
+                                          show='•')
+        if password:
+            try:
+                source_decrypted = False
+                if original_source_path:
+                    enc_source_path = original_source_path + ".enc"
+                    if os.path.exists(enc_source_path):
+                        with open(enc_source_path, "rb") as f:
+                            encrypted_data = f.read()
+                        decrypted_data = decrypt_image_data(encrypted_data, password)
+                        if decrypted_data:
+                            with open(original_source_path, "wb") as f:
+                                f.write(decrypted_data)
+                                f.flush()
+                                os.fsync(f.fileno())
+                            os.remove(enc_source_path)
+                            self.image_source_paths[original_source_path] = original_source_path
+                            if enc_source_path in self.image_source_paths:
+                                del self.image_source_paths[enc_source_path]
+                            source_decrypted = True
+
+                with open(self.current_image, "rb") as f:
+                    encrypted_data = f.read()
+
+                decrypted_data = decrypt_image_data(encrypted_data, password)
+                if decrypted_data:
+                    dec_path = self.current_image[:-4]
+                    with open(dec_path, "wb") as f:
+                        f.write(decrypted_data)
+                        f.flush()
+                        os.fsync(f.fileno())
+
+                    os.remove(self.current_image)
+
+                    original_index = self.current_image_index
+                    self.uploaded_images[original_index] = dec_path
+                    self.encryption_status[dec_path] = False
+                    self.current_image = dec_path
+
+                    self.load_current_image()
+                    self.save_case_state()
+
+                    if source_decrypted:
+                        messagebox.showinfo("Success",
+                                            "Image permanently decrypted in BOTH locations!\n\n• In tool: Now visible and viewable\n• In source folder: Restored to original\n• No longer encrypted")
+                    else:
+                        messagebox.showinfo("Success",
+                                            "Image permanently decrypted in tool!\n\n• In tool: Now visible and viewable\n• Source location not found or already decrypted")
+                else:
+                    messagebox.showerror("Error", "Wrong password or corrupted file")
+            except Exception as e:
+                messagebox.showerror("Error", f"Decryption failed: {str(e)}")
+
+    def decrypt_all_images(self):
+        if not self.uploaded_images:
+            messagebox.showwarning("No Images", "No images in case to decrypt!")
+            return
+
+        encrypted_count = sum(1 for img in self.uploaded_images if img.endswith('.enc'))
+        if encrypted_count == 0:
+            messagebox.showinfo("Already Decrypted", "All images are already decrypted!")
+            return
+
+        response = messagebox.askyesno("Decrypt All Images",
+                                       f"⚠️ COMPLETE DECRYPTION\n\n"
+                                       f"This will permanently decrypt ALL {encrypted_count} encrypted images:\n\n"
+                                       f"1. Inside PicForensics tool\n"
+                                       f"2. In original source folders\n\n"
+                                       f"Images will become visible and accessible in both locations.\n\n"
+                                       f"Continue?")
+        if not response:
+            return
+
+        password = simpledialog.askstring("Decryption Password",
+                                          f"Enter password to decrypt all {encrypted_count} images:",
+                                          show='•')
+        if password:
+            success_count = 0
+            failed_count = 0
+
+            for i, file_path in enumerate(self.uploaded_images[:]):
+                if file_path.endswith('.enc'):
+                    try:
+                        with open(file_path, "rb") as f:
+                            encrypted_data = f.read()
+
+                        decrypted_data = decrypt_image_data(encrypted_data, password)
+                        if decrypted_data:
+                            dec_path = file_path[:-4]
+                            with open(dec_path, "wb") as f:
+                                f.write(decrypted_data)
+                                f.flush()
+                                os.fsync(f.fileno())
+
+                            os.remove(file_path)
+                            self.uploaded_images[i] = dec_path
+                            self.encryption_status[dec_path] = False
+                            success_count += 1
+                        else:
+                            failed_count += 1
+                    except:
+                        failed_count += 1
+
+            for src_path in list(self.image_source_paths.keys()):
+                if src_path.endswith('.enc'):
+                    try:
+                        with open(src_path, "rb") as f:
+                            encrypted_data = f.read()
+
+                        decrypted_data = decrypt_image_data(encrypted_data, password)
+                        if decrypted_data:
+                            original_source_path = src_path[:-4]
+                            with open(original_source_path, "wb") as f:
+                                f.write(decrypted_data)
+                                f.flush()
+                                os.fsync(f.fileno())
+
+                            os.remove(src_path)
+                            self.image_source_paths[original_source_path] = original_source_path
+                            del self.image_source_paths[src_path]
+                    except:
+                        pass
+
+            if success_count > 0:
+                self.current_image_index = 0 if self.uploaded_images else -1
+                if self.uploaded_images:
+                    self.load_current_image()
+                self.save_case_state()
+
+                result_msg = f"{success_count} images decrypted in BOTH locations!\n\n"
+                result_msg += "✅ INSIDE TOOL:\n• Images now visible\n• Can be viewed and analyzed\n\n"
+                result_msg += "✅ IN SOURCE FOLDER:\n• Files restored to original\n• Can be opened normally"
+
+                if failed_count > 0:
+                    result_msg += f"\n\n{failed_count} images failed to decrypt"
+
+                messagebox.showinfo("Complete Decryption", result_msg)
+            else:
+                messagebox.showerror("Error", "Failed to decrypt any images\nWrong password or corrupted files")
+
+    def delete_case(self):
+        if not self.current_case_folder:
+            messagebox.showwarning("No Case", "No case is currently open!")
+            return
+
+        response = messagebox.askyesno("Delete Case",
+                                       f"⚠️ PERMANENT CASE DELETION\n\n"
+                                       f"This will COMPLETELY delete case:\n"
+                                       f"• Case ID: {self.current_case_id}\n"
+                                       f"• Case Name: {self.current_case_name}\n"
+                                       f"• All images in case folder\n"
+                                       f"• Case folder: {self.current_case_folder}\n\n"
+                                       f"This action cannot be undone!\n\n"
+                                       f"Continue?")
+        if not response:
+            return
+
+        try:
+            if self.current_case_id in self.cases:
+                del self.cases[self.current_case_id]
+                self.save_cases()
+
+            shutil.rmtree(self.current_case_folder)
+
+            self.current_case_folder = None
+            self.current_case_id = None
+            self.current_case_name = None
+            self.uploaded_images = []
+            self.current_image_index = -1
+            self.image_source_paths = {}
+            self.encryption_status = {}
+            self.cleanup_temp_files()
+
+            if self.image_label:
+                self.image_label.destroy()
+                self.image_label = None
+
+            self.image_placeholder.config(text="No Case Open\nClick 'Open/Create Case' to start")
+            self.image_placeholder.pack(expand=True)
+
+            for key in self.info_labels:
+                self.info_labels[key].config(text="No image loaded")
+
+            self.hide_action_buttons()
+            self.update_navigation_buttons()
+
+            messagebox.showinfo("Case Deleted", "Case deleted successfully!")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to delete case: {str(e)}")
+
+    def save_case_state(self):
+        if self.current_case_id:
+            self.cases[self.current_case_id]["images"] = [os.path.basename(img) for img in self.uploaded_images]
+            self.save_cases()
 
     def meta_data_analysis(self):
         self.analysis_var.set(f"Analysis Results ▼")
@@ -697,10 +2079,63 @@ Professional forensic analysis tool"""
             return
 
         try:
-            result = self.timeline_analyzer.analyze_image(self.current_image)
+            if self.current_image.endswith('.enc'):
+                if self.current_image not in self.temp_images:
+                    messagebox.showwarning("Encrypted Image", "Please decrypt the image for analysis first!")
+                    return
+                image_to_analyze = self.temp_images[self.current_image]
+            else:
+                image_to_analyze = self.current_image
+
+            result = self.metadata_extractor.extract_comprehensive_metadata(image_to_analyze)
+
+            if "error" in result:
+                messagebox.showerror("Error", result["error"])
+                return
+
             meta_info = "Comprehensive Metadata Analysis\n\n"
-            for key, value in result.date_time_results.items():
-                meta_info += f"{key}: {value}\n"
+            meta_info += "=" * 50 + "\n\n"
+
+            if "file_information" in result:
+                meta_info += "📄 FILE INFORMATION\n"
+                meta_info += "-" * 30 + "\n"
+                for key, value in result["file_information"].items():
+                    meta_info += f"{key.replace('_', ' ').title()}: {value}\n"
+                meta_info += "\n"
+
+            if "camera_information" in result:
+                meta_info += "📷 CAMERA INFORMATION\n"
+                meta_info += "-" * 30 + "\n"
+                for key, value in result["camera_information"].items():
+                    meta_info += f"{key.replace('_', ' ').title()}: {value}\n"
+                meta_info += "\n"
+
+            if "shooting_parameters" in result:
+                meta_info += "⚙️ SHOOTING PARAMETERS\n"
+                meta_info += "-" * 30 + "\n"
+                for key, value in result["shooting_parameters"].items():
+                    meta_info += f"{key.replace('_', ' ').title()}: {value}\n"
+                meta_info += "\n"
+
+            if "gps_data" in result:
+                meta_info += "📍 GPS DATA\n"
+                meta_info += "-" * 30 + "\n"
+                for key, value in result["gps_data"].items():
+                    meta_info += f"{key.replace('_', ' ').title()}: {value}\n"
+                meta_info += "\n"
+
+            if "forensic_analysis" in result:
+                meta_info += "🔍 FORENSIC ANALYSIS\n"
+                meta_info += "-" * 30 + "\n"
+                fa = result["forensic_analysis"]
+                meta_info += f"Consistency Score: {fa.get('consistency_score', 0)}/1.0\n"
+                if fa.get('editing_software_detected'):
+                    meta_info += f"Editing Software Detected: {', '.join(fa['editing_software_detected'])}\n"
+
+            if self.current_image.endswith('.enc'):
+                meta_info += "\n⚠️ NOTE: Analysis performed on temporary decrypted copy\n"
+                meta_info += "Original file remains encrypted (.enc) in both locations\n"
+
             self.show_analysis_results("Meta Data Analysis", meta_info)
         except Exception as e:
             messagebox.showerror("Error", f"Meta data analysis failed: {str(e)}")
@@ -712,11 +2147,24 @@ Professional forensic analysis tool"""
             return
 
         try:
-            result = self.timeline_analyzer.analyze_image(self.current_image)
+            if self.current_image.endswith('.enc'):
+                if self.current_image not in self.temp_images:
+                    messagebox.showwarning("Encrypted Image", "Please decrypt the image for analysis first!")
+                    return
+                image_to_analyze = self.temp_images[self.current_image]
+            else:
+                image_to_analyze = self.current_image
+
+            result = self.timeline_analyzer.analyze_image(image_to_analyze)
             timeline_info = "Timeline Analysis\n\n"
             for key, value in result.date_time_results.items():
                 if "DATE" in key.upper() or "TIME" in key.upper():
                     timeline_info += f"{key}: {value}\n"
+
+            if self.current_image.endswith('.enc'):
+                timeline_info += "\n⚠️ NOTE: Analysis performed on temporary decrypted copy\n"
+                timeline_info += "Original file remains encrypted (.enc) in both locations\n"
+
             self.show_analysis_results("Timeline Analysis", timeline_info)
         except Exception as e:
             messagebox.showerror("Error", f"Timeline analysis failed: {str(e)}")
@@ -728,20 +2176,21 @@ Professional forensic analysis tool"""
             return
 
         try:
-            result = self.ai_detector.analyze(self.current_image)
-            ai_info = f"AI Detection Analysis\n\n"
-            ai_info += f"AI Probability: {result['ai_probability']:.2%}\n"
-            ai_info += f"Confidence Level: {result['confidence']}\n"
-
-            if result['ai_probability'] > 0.7:
-                ai_info += "\nHIGH PROBABILITY: This image is likely AI-generated\n"
-            elif result['ai_probability'] > 0.5:
-                ai_info += "\nMODERATE PROBABILITY: Possible AI involvement\n"
+            if self.current_image.endswith('.enc'):
+                if self.current_image not in self.temp_images:
+                    messagebox.showwarning("Encrypted Image", "Please decrypt the image for analysis first!")
+                    return
+                image_to_analyze = self.temp_images[self.current_image]
             else:
-                ai_info += "\nLOW PROBABILITY: Likely authentic human-created image\n"
+                image_to_analyze = self.current_image
 
-            self.last_ai_result = f"{result['ai_probability']:.1%} ({result['confidence']})"
-            self.show_analysis_results("AI Detection Analysis", ai_info)
+            correlation_results = self.ai_detector.analyze_noise_correlation(image_to_analyze)
+
+            if correlation_results is None:
+                messagebox.showerror("Error", "Failed to analyze image for AI detection")
+                return
+
+            self.ai_detector.visualize_results(correlation_results)
 
         except Exception as e:
             messagebox.showerror("Error", f"AI detection analysis failed: {str(e)}")
@@ -753,7 +2202,15 @@ Professional forensic analysis tool"""
             return
 
         try:
-            ela_image = compute_ela(self.current_image)
+            if self.current_image.endswith('.enc'):
+                if self.current_image not in self.temp_images:
+                    messagebox.showwarning("Encrypted Image", "Please decrypt the image for analysis first!")
+                    return
+                image_to_analyze = self.temp_images[self.current_image]
+            else:
+                image_to_analyze = self.current_image
+
+            ela_image = compute_ela(image_to_analyze)
             if ela_image:
                 self.display_analysis_image(ela_image, "ELA Analysis")
             else:
@@ -768,7 +2225,16 @@ Professional forensic analysis tool"""
             return
 
         try:
-            noise_array = extract_noise(self.current_image)
+            if self.current_image.endswith('.enc'):
+                if self.current_image not in self.temp_images:
+                    messagebox.showwarning("Encrypted Image", "Please decrypt the image for analysis first!")
+                    return
+                image_to_analyze = self.temp_images[self.current_image]
+            else:
+                image_to_analyze = self.current_image
+
+            img = Image.open(image_to_analyze).convert("RGB")
+            noise_array = extract_noise_stat(img)
             noise_normalized = (noise_array - noise_array.min()) / (noise_array.max() - noise_array.min() + 1e-8)
             noise_uint8 = (noise_normalized * 255).astype(np.uint8)
             noise_image = Image.fromarray(noise_uint8)
@@ -783,8 +2249,16 @@ Professional forensic analysis tool"""
             return
 
         try:
+            if self.current_image.endswith('.enc'):
+                if self.current_image not in self.temp_images:
+                    messagebox.showwarning("Encrypted Image", "Please decrypt the image for analysis first!")
+                    return
+                image_to_analyze = self.temp_images[self.current_image]
+            else:
+                image_to_analyze = self.current_image
+
             import matplotlib.pyplot as plt
-            image = Image.open(self.current_image).convert("RGB")
+            image = Image.open(image_to_analyze).convert("RGB")
             plt.figure(figsize=(6, 4))
             colors = ('red', 'green', 'blue')
             for i, color in enumerate(colors):
@@ -807,12 +2281,23 @@ Professional forensic analysis tool"""
     def show_analysis_results(self, title, results):
         results_window = tk.Toplevel(self.root)
         results_window.title(title)
-        results_window.geometry("500x400")
+        results_window.geometry("700x800")
         results_window.configure(bg="white")
-        text_widget = tk.Text(results_window, wrap=tk.WORD, font=("Arial", 10))
-        text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        frame = tk.Frame(results_window, bg="white")
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        scrollbar = tk.Scrollbar(frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        text_widget = tk.Text(frame, wrap=tk.WORD, font=("Courier New", 9),
+                              yscrollcommand=scrollbar.set, bg="white", fg="black")
+        text_widget.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=text_widget.yview)
+
         text_widget.insert(tk.END, results)
         text_widget.config(state=tk.DISABLED)
+
         close_btn = tk.Button(results_window, text="Close", command=results_window.destroy,
                               bg="#2196f3", fg="white", font=("Arial", 10))
         close_btn.pack(pady=10)
@@ -821,81 +2306,30 @@ Professional forensic analysis tool"""
         analysis_window = tk.Toplevel(self.root)
         analysis_window.title(title)
         analysis_window.geometry("600x500")
-        image_frame = tk.Frame(analysis_window)
+        analysis_window.configure(bg="white")
+
+        image_frame = tk.Frame(analysis_window, bg="white")
         image_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
         display_image = pil_image.copy()
         display_image.thumbnail((550, 400), Image.Resampling.LANCZOS)
         photo = ImageTk.PhotoImage(display_image)
-        image_label = tk.Label(image_frame, image=photo)
+
+        image_label = tk.Label(image_frame, image=photo, bg='white')
         image_label.image = photo
         image_label.pack(expand=True)
+
         close_btn = tk.Button(analysis_window, text="Close", command=analysis_window.destroy,
                               bg="#2196f3", fg="white", font=("Arial", 10))
         close_btn.pack(pady=10)
 
-    def open_image(self):
-        file_paths = filedialog.askopenfilenames(
-            title="Select Images",
-            filetypes=[("Image files", "*.jpg *.jpeg *.png *.gif *.bmp")]
-        )
-        if file_paths:
-            new_images = list(file_paths)
-            self.uploaded_images.extend(new_images)
-            if self.current_image_index == -1:
-                self.current_image_index = 0
-            self.load_current_image()
 
-    def load_and_display_image(self, file_path):
-        self.image_placeholder.pack_forget()
-        image = Image.open(file_path)
-        frame_width = 380
-        frame_height = 280
-        image.thumbnail((frame_width, frame_height), Image.Resampling.LANCZOS)
-        photo = ImageTk.PhotoImage(image)
-        if self.image_label:
-            self.image_label.destroy()
-        self.image_label = tk.Label(self.image_frame, image=photo, bg='white')
-        self.image_label.image = photo
-        self.image_label.pack(expand=True)
-        self.current_image = file_path
-
-    def update_image_info(self, file_path):
-        try:
-            file_size = os.path.getsize(file_path) / (1024 * 1024)
-            file_name = os.path.basename(file_path)
-            file_ext = os.path.splitext(file_name)[1].upper().replace(".", "")
-            self.info_labels["File Size"].config(text=f"{file_size:.2f}MB")
-            self.info_labels["File Format"].config(text=file_ext)
-            self.info_labels["File Path"].config(text=file_path)
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not get image info: {str(e)}")
-
-    def delete_image(self):
-        if not self.current_image:
-            messagebox.showwarning("Delete Image", "No image to delete!")
-            return
-        result = messagebox.askyesno("Delete Image", "Are you sure you want to delete this image?")
-        if result:
-            if 0 <= self.current_image_index < len(self.uploaded_images):
-                self.uploaded_images.pop(self.current_image_index)
-                if self.uploaded_images:
-                    if self.current_image_index >= len(self.uploaded_images):
-                        self.current_image_index = len(self.uploaded_images) - 1
-                    self.load_current_image()
-                else:
-                    if self.image_label:
-                        self.image_label.destroy()
-                        self.image_label = None
-                    self.image_placeholder.pack(expand=True)
-                    for key in self.info_labels:
-                        self.info_labels[key].config(text="No image loaded")
-                    self.current_image = None
-                    self.current_image_index = -1
-                    self.update_navigation_buttons()
-            messagebox.showinfo("Delete Image", "Image deleted successfully!")
+def main():
+    root = tk.Tk()
+    app = PicForensicsApp(root)
+    root.protocol("WM_DELETE_WINDOW", lambda: [app.cleanup_temp_files(), root.quit()])
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = PicForensicsApp(root)
-    root.mainloop()
+    main()
