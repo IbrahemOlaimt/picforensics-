@@ -75,12 +75,17 @@
     <section class="hero">
       <div>
         <div class="card">
-          <h2 style="margin-top:0">PicForensics: A Forensic Tool for Image Metadata Analysis</h2>
+          <h2 style="margin-top:0">Professional Image Forensics with Military-Grade Encryption</h2>
           <p class="lead">Case-based digital forensics tool featuring complete AES-128 encryption system, SHA-256 integrity verification, AI detection, and comprehensive metadata analysis. All processing happens locally on your machine.</p>
 
           <div style="margin-top:16px" class="cta">
-           <a id="downloadBtn" class="btn" href="PicForensics.zip" download="PicForensics.zip">
-  ⬇️ Download PicForensics (ZIP)</a>
+            
+            <a id="downloadBtn" class="btn" 
+               href="https://drive.google.com/uc?export=download&id=1TWnFTBs6oTZUYZxzwVQK7EDw8BmdzWBp"
+               download="PicForensics.zip">
+              ⬇️ Download PicForensics (ZIP)
+            </a>
+            <a class="btn secondary" href="#docs">📖 User Guide</a>
           </div>
 
           <div class="features" style="margin-top:18px">
@@ -97,35 +102,19 @@
               <div class="muted">Organized forensic workflow with case tracking</div>
             </div>
           </div>
+
+          <div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap">
+            <div class="muted" style="font-size:13px">Secure • Local Analysis • Audit Trail</div>
+            <div class="muted" style="font-size:13px">No installation required • Standalone executable</div>
+          </div>
         </div>
 
         <div class="card" style="margin-top:12px">
-          <h3 style="margin:0 0 8px">Core Features</h3>
-          <div class="feature-grid">
-            <div class="feature-item">
-              <h4 style="margin:0 0 8px">🔒 Complete Encryption</h4>
-              <p class="muted" style="margin:0">Encrypts images in both tool AND original source location. Cannot view encrypted images without password.</p>
-            </div>
-            <div class="feature-item">
-              <h4 style="margin:0 0 8px">🔍 SHA-256 Integrity</h4>
-              <p class="muted" style="margin:0">Hash-based tamper detection for individual images and entire cases.</p>
-            </div>
-            <div class="feature-item">
-              <h4 style="margin:0 0 8px">📁 Case Management</h4>
-              <p class="muted" style="margin:0">Organized case workflow with folder-based evidence storage.</p>
-            </div>
-            <div class="feature-item">
-              <h4 style="margin:0 0 8px">📊 Advanced Metadata</h4>
-              <p class="muted" style="margin:0">EXIF, GPS, camera info, timestamps with exifread library.</p>
-            </div>
-            <div class="feature-item">
-              <h4 style="margin:0 0 8px">🤖 AI Detection</h4>
-              <p class="muted" style="margin:0">Noise correlation analysis for AI-generated content detection.</p>
-            </div>
-            <div class="feature-item">
-              <h4 style="margin:0 0 8px">⏱️ Timeline Analysis</h4>
-              <p class="muted" style="margin:0">Comprehensive date/time extraction from EXIF and filesystem.</p>
-            </div>
+          <h3 style="margin:0 0 8px">Quick Links</h3>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <a class="btn secondary" href="#modules">Features</a>
+            <a class="btn secondary" href="#docs">User Guide</a>
+            <a class="btn secondary" href="#verification">Verification</a>
           </div>
         </div>
 
@@ -133,21 +122,24 @@
 
       <aside class="download-panel">
         <div class="card">
-          <h3 style="margin:0 0 8px">Download & Verify</h3>
-          <p class="muted">Standalone Windows executable. No installation required.</p>
+          <h3 style="margin:0 0 8px">Download PicForensics</h3>
+          <p class="muted">Direct download from Google Drive • No registration required</p>
 
           <div style="margin-top:12px">
-            <div class="meta-line">Filename: <strong>PicForensics.exe</strong></div>
-            <div class="meta-line">Filesize: <strong id="fileSize">~20 MB (varies)</strong></div>
+            <div class="meta-line">Filename: <strong>PicForensics.zip</strong></div>
+            <div class="meta-line">Filesize: <strong id="fileSize">~50 MB</strong></div>
+            <div class="meta-line">Contains: <strong>PicForensics.exe + All Dependencies</strong></div>
             <div class="meta-line">Platform: <strong>Windows 10/11 (64-bit)</strong></div>
-            <div class="meta-line">SHA256 Checksum:</div>
+            <div class="meta-line">Direct Download Link:</div>
             <div class="sha" id="shaValue">
-              <!-- CALCULATE THIS FROM YOUR ACTUAL FILE -->
-              Run: certutil -hashfile PicForensics.exe SHA256
+              https://drive.google.com/uc?export=download&id=1TWnFTBs6oTZUYZxzwVQK7EDw8BmdzWBp
             </div>
             <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-              <button class="btn secondary" onclick="copySha()">Copy Verification Command</button>
-              <button class="btn secondary" onclick="showQuickStart()">Quick Start</button>
+              <button class="btn secondary" onclick="copyDownloadLink()">Copy Download Link</button>
+              <button class="btn secondary" onclick="showInstructions()">Installation Guide</button>
+            </div>
+            <div style="margin-top:10px;color:var(--muted);font-size:13px">
+              Clicking the download button starts immediate download. No survey, no wait.
             </div>
           </div>
         </div>
@@ -156,9 +148,10 @@
           <h4 style="margin:0">System Requirements</h4>
           <ul class="muted" style="margin:8px 0 0; padding-left:20px">
             <li>Windows 10 or 11 (64-bit)</li>
-            <li>4GB RAM minimum (8GB recommended)</li>
-            <li>Python libraries included in executable</li>
-            <li>No internet connection required</li>
+            <li>4GB RAM minimum</li>
+            <li>100MB free disk space</li>
+            <li>No Python installation required</li>
+            <li>No internet connection needed after download</li>
           </ul>
         </div>
       </aside>
@@ -166,28 +159,28 @@
 
     <section id="modules" class="modules">
       <div class="module card">
-        <h3>🔒 Encryption System</h3>
+        <h3>🔒 Complete Encryption System</h3>
         <p class="muted">Military-grade AES-128 encryption. Images encrypted in BOTH tool and source location. Cannot view encrypted images without password. Temporary decryption for analysis only.</p>
         <div class="muted" style="margin-top:8px; font-size:13px">
           • Encrypt Current Image • Decrypt for Analysis • Encrypt Entire Folder • Permanently Decrypt
         </div>
       </div>
       <div class="module card">
-        <h3>🔍 Integrity Verification</h3>
-        <p class="muted">SHA-256 hash-based tamper detection. Individual image hashing and case-wide integrity verification. Automatic baseline hash saving and comparison.</p>
+        <h3>🔍 SHA-256 Integrity Verification</h3>
+        <p class="muted">Hash-based tamper detection. Individual image hashing and case-wide integrity verification. Automatic baseline hash saving and comparison.</p>
         <div class="muted" style="margin-top:8px; font-size:13px">
           • Hash Check (Individual) • Case Hash (Entire Case) • Auto-hash on load
         </div>
       </div>
       <div class="module card">
-        <h3>📊 Forensic Analysis</h3>
+        <h3>📊 Comprehensive Forensic Analysis</h3>
         <p class="muted">Advanced metadata extraction with exifread, timeline analysis, Error Level Analysis (ELA), noise analysis, histogram analysis, and AI detection via noise correlation.</p>
         <div class="muted" style="margin-top:8px; font-size:13px">
-          • Metadata • Timeline • ELA • Noise • Histogram • AI Detection
+          • Metadata Analysis • Timeline Analysis • ELA • Noise • Histogram • AI Detection
         </div>
       </div>
       <div class="module card">
-        <h3>📁 Case Management</h3>
+        <h3>📁 Professional Case Management</h3>
         <p class="muted">Professional case-based workflow. Create cases with ID and name, load images, track evidence, save case states, and open previous cases with all evidence intact.</p>
         <div class="muted" style="margin-top:8px; font-size:13px">
           • Create/Open Case • Open Old Case • Delete Case • Save Case State
@@ -202,16 +195,16 @@
 
         <div class="accordion" id="accordion">
           <div class="acc-item">
-            <div class="acc-head"> <strong>Getting Started</strong> <span class="muted">Click to expand</span></div>
+            <div class="acc-head"> <strong>📦 Installation & Setup</strong> <span class="muted">Click to expand</span></div>
             <div class="acc-body">
-              <p><strong>Step 1 — Create/Open Case</strong><br>Click "Open/Create Case" → Enter Case ID and Name → Creates organized folder structure.</p>
-              <p><strong>Step 2 — Upload Images</strong><br>Click "Upload Folder" → Select folder with images → Images copied to case folder.</p>
-              <p><strong>Step 3 — Navigate Images</strong><br>Use ◀ Previous / Next ▶ buttons to browse images in case.</p>
+              <p><strong>Step 1 — Download</strong><br>Click the download button above to get PicForensics.zip</p>
+              <p><strong>Step 2 — Extract</strong><br>Right-click PicForensics.zip → Extract All → Choose destination folder</p>
+              <p><strong>Step 3 — Run</strong><br>Open extracted folder → Double-click PicForensics.exe → No installation required!</p>
             </div>
           </div>
 
           <div class="acc-item">
-            <div class="acc-head"><strong>Complete Encryption System</strong></div>
+            <div class="acc-head"><strong>🔐 Complete Encryption System</strong></div>
             <div class="acc-body">
               <p><strong>Encrypt Current Image</strong><br>Encrypts image in BOTH locations (tool + source folder). Image becomes unviewable without password.</p>
               <p><strong>Decrypt for Analysis</strong><br>Temporary decryption for analysis only. Original remains encrypted.</p>
@@ -222,7 +215,7 @@
           </div>
 
           <div class="acc-item">
-            <div class="acc-head"><strong>Integrity Verification (SHA-256)</strong></div>
+            <div class="acc-head"><strong>🔍 Integrity Verification (SHA-256)</strong></div>
             <div class="acc-body">
               <p><strong>Hash Check</strong><br>Verifies individual image integrity. Compares current hash with baseline. Shows: MATCH (original), MODIFIED (tampered), or FIRST (new baseline).</p>
               <p><strong>Case Hash</strong><br>Verifies integrity of ENTIRE case. Detects if any images were added/removed/modified.</p>
@@ -231,7 +224,7 @@
           </div>
 
           <div class="acc-item">
-            <div class="acc-head"><strong>Forensic Analysis Tools</strong></div>
+            <div class="acc-head"><strong>🔬 Forensic Analysis Tools</strong></div>
             <div class="acc-body">
               <p><strong>Meta Data Analysis</strong><br>Comprehensive metadata extraction using exifread library. Shows camera info, GPS, timestamps, forensic consistency score.</p>
               <p><strong>Time Line Analysis</strong><br>Extracts all date/time information from EXIF and filesystem metadata.</p>
@@ -243,7 +236,7 @@
           </div>
 
           <div class="acc-item">
-            <div class="acc-head"><strong>Case Management</strong></div>
+            <div class="acc-head"><strong>📁 Case Management</strong></div>
             <div class="acc-body">
               <p><strong>Create New Case</strong><br>Organizes all evidence in dedicated folder with Case ID and Name.</p>
               <p><strong>Open Old Case</strong><br>Loads previously created cases with all images and encryption status preserved.</p>
@@ -255,8 +248,8 @@
       </div>
     </section>
 
-    <section style="margin-top:18px" class="card">
-      <h3 style="margin-top:0">Verification & Security</h3>
+    <section id="verification" style="margin-top:18px" class="card">
+      <h3 style="margin-top:0">🔒 Verification & Security</h3>
       <p class="muted">Verify the integrity of your download using SHA-256 checksums.</p>
 
       <div style="margin-top:10px">
@@ -266,17 +259,19 @@
         <h4 style="margin:6px 0">How to Verify (Windows PowerShell)</h4>
         <pre class="code">Get-FileHash .\PicForensics.exe -Algorithm SHA256</pre>
         
-        <h4 style="margin:6px 0">Compare with Expected Hash</h4>
-        <pre class="code">Expected: [Your actual SHA-256 hash here]
-Actual:   [Result from command above]
-
-If they match → File is authentic and untampered
-If they differ → File may be corrupted or malicious</pre>
+        <h4 style="margin:6px 0">Expected SHA-256 Hash</h4>
+        <pre class="code" id="expectedHash">
+After downloading, run the command above to get the actual hash.
+Compare with the hash displayed after you calculate it.</pre>
+        
+        <button class="btn secondary" onclick="calculateHash()" style="margin-top:10px">
+          How to Calculate Hash
+        </button>
       </div>
     </section>
 
     <section style="margin-top:18px" class="card">
-      <h3 style="margin-top:0">Technical Implementation</h3>
+      <h3 style="margin-top:0">⚙️ Technical Implementation</h3>
       <div class="feature-grid">
         <div class="feature-item">
           <h4 style="margin:0 0 8px">🔐 Encryption</h4>
@@ -314,20 +309,40 @@ If they differ → File may be corrupted or malicious</pre>
       });
     });
 
-    function copySha() {
-      const text = 'certutil -hashfile PicForensics.exe SHA256';
-      navigator.clipboard.writeText(text).then(() => {
-        alert('Verification command copied to clipboard!\n\nPaste in Command Prompt to verify file integrity.');
+    function copyDownloadLink() {
+      const link = "https://drive.google.com/uc?export=download&id=1TWnFTBs6oTZUYZxzwVQK7EDw8BmdzWBp";
+      navigator.clipboard.writeText(link).then(() => {
+        alert('✅ Download link copied to clipboard!\n\nPaste this link anywhere to download PicForensics.');
       });
     }
 
-    function showQuickStart() {
-      alert('QUICK START GUIDE:\n\n1. Download PicForensics.exe\n2. Create a new case (Open/Create Case)\n3. Upload images (Upload Folder)\n4. Use analysis tools (Meta Data, AI Detection, etc.)\n5. Encrypt sensitive images (Encrypt Current Image)\n6. Verify integrity (Hash Check)\n\nAll files stored locally. No internet required.');
+    function showInstructions() {
+      alert('📋 INSTALLATION INSTRUCTIONS:\n\n1. Download PicForensics.zip\n2. Extract to any folder (right-click → Extract All)\n3. Open the extracted "PicForensics" folder\n4. Double-click PicForensics.exe\n5. No installation required!\n\n⚠️ Note: Windows Defender may show a warning. This is normal for standalone executables. Click "More info" → "Run anyway".');
+    }
+
+    function calculateHash() {
+      alert('🔢 HOW TO CALCULATE SHA-256 HASH:\n\n1. After downloading and extracting PicForensics.zip\n2. Open Command Prompt in the PicForensics folder\n3. Type: certutil -hashfile PicForensics.exe SHA256\n4. Press Enter\n5. Compare the hash with the expected value\n\nThis verifies the file is authentic and not tampered with.');
     }
 
     // Set current year in footer
     document.querySelector('footer div:first-child').innerHTML = 
       `© ${new Date().getFullYear()} PicForensics — Developed by Ibrahim Olimat`;
+
+    // Smooth scroll for anchor links
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+      anchor.addEventListener('click', function(e) {
+        e.preventDefault();
+        const targetId = this.getAttribute('href');
+        if(targetId === '#') return;
+        const targetElement = document.querySelector(targetId);
+        if(targetElement) {
+          window.scrollTo({
+            top: targetElement.offsetTop - 20,
+            behavior: 'smooth'
+          });
+        }
+      });
+    });
   </script>
 </body>
 </html>
