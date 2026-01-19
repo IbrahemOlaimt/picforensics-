@@ -23,10 +23,17 @@ import hashlib
 from pathlib import Path
 from dataclasses import dataclass
 from skimage.util import view_as_blocks
+import matplotlib
+
+# Use Agg backend for matplotlib to avoid GUI issues
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 warnings.filterwarnings('ignore')
 
+
+# ========== HASH FUNCTIONS ==========
 def compute_image_hash(file_path: str) -> str:
     sha = hashlib.sha256()
     with open(file_path, "rb") as f:
@@ -55,7 +62,6 @@ def _save_hash_registry(registry_file: str, registry_list):
 
 
 def save_hash_to_registry(registry_file: str, key: str, img_hash: str, meta: dict | None = None):
-
     registry = _load_hash_registry(registry_file)
     registry = [e for e in registry if e.get("key") != key]
     entry = {
@@ -86,7 +92,6 @@ def compare_hashes(old_hash: str | None, new_hash: str) -> str:
 
 
 def compute_case_hash(image_paths: list[str]) -> str:
-
     pairs = []
     for p in sorted(image_paths, key=lambda x: os.path.basename(x).lower()):
         try:
@@ -96,6 +101,8 @@ def compute_case_hash(image_paths: list[str]) -> str:
     combined = "\n".join(pairs).encode("utf-8", errors="ignore")
     return hashlib.sha256(combined).hexdigest()
 
+
+# ========== END HASH FUNCTIONS ==========
 
 def compute_ela(image_path, q=90):
     try:
@@ -117,6 +124,7 @@ def compute_ela(image_path, q=90):
     except Exception as e:
         return None
 
+
 def extract_noise_stat(img):
     if isinstance(img, str):
         img = Image.open(img)
@@ -125,9 +133,11 @@ def extract_noise_stat(img):
     lap = cv2.Laplacian(arr, cv2.CV_32F)
     return lap
 
+
 def derive_key_from_password(password, salt):
     key = PBKDF2(password, salt, dkLen=16, count=100000)
     return key
+
 
 def encrypt_image_data(image_data, password):
     try:
@@ -139,6 +149,7 @@ def encrypt_image_data(image_data, password):
         return salt + iv + encrypted_data
     except Exception as e:
         return None
+
 
 def decrypt_image_data(encrypted_data, password):
     try:
@@ -152,11 +163,13 @@ def decrypt_image_data(encrypted_data, password):
     except Exception as e:
         return None
 
+
 @dataclass
 class ForensicAnalysis:
     tampering_indicators: list
     consistency_score: float
     editing_software_detected: list
+
 
 class AdvancedMetadataExtractor:
     def __init__(self, enable_cache: bool = True, enable_geocoding: bool = True):
@@ -555,6 +568,7 @@ class AdvancedMetadataExtractor:
             bytes_num /= 1024.0
         return f"{bytes_num:.2f} TB"
 
+
 class AIDetectionAnalyzer:
     def __init__(self):
         self.BLOCK_SIZE = 8
@@ -566,64 +580,156 @@ class AIDetectionAnalyzer:
         ])
 
     def analyze_noise_correlation(self, image_path):
-        img = cv2.imread(image_path)
-        if img is None:
+        try:
+            img = cv2.imread(image_path)
+            if img is None:
+                return None
+
+            # Ensure image has proper dimensions for analysis
+            if img.shape[0] < self.BLOCK_SIZE or img.shape[1] < self.BLOCK_SIZE:
+                # Resize small images
+                min_size = max(self.BLOCK_SIZE * 2, 32)
+                if img.shape[0] < min_size or img.shape[1] < min_size:
+                    scale = max(min_size / img.shape[0], min_size / img.shape[1])
+                    new_width = int(img.shape[1] * scale)
+                    new_height = int(img.shape[0] * scale)
+                    img = cv2.resize(img, (new_width, new_height))
+
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
+            Y, Cr, Cb = cv2.split(img)
+
+            channels = {
+                "Y": Y,
+                "Cb": Cb,
+                "Cr": Cr
+            }
+
+            correlation_results = {}
+
+            for name, channel in channels.items():
+                noise = cv2.filter2D(channel.astype(np.float32), -1, self.LAPLACIAN)
+
+                h, w = noise.shape
+                h_trim = h - (h % self.BLOCK_SIZE)
+                w_trim = w - (w % self.BLOCK_SIZE)
+                noise = noise[:h_trim, :w_trim]
+
+                blocks = view_as_blocks(noise, block_shape=(self.BLOCK_SIZE, self.BLOCK_SIZE))
+                blocks = blocks.reshape(-1, self.BLOCK_SIZE * self.BLOCK_SIZE)
+
+                means = np.mean(blocks, axis=1)
+                variances = np.var(blocks, axis=1)
+
+                idx_mean = np.argsort(np.abs(means))[:self.T_BLOCKS]
+                idx_var = np.argsort(variances)[:self.T_BLOCKS]
+
+                selected_idx = np.unique(np.concatenate([idx_mean, idx_var]))
+                selected_blocks = blocks[selected_idx]
+
+                if selected_blocks.shape[0] < self.T_BLOCKS:
+                    selected_blocks = blocks[np.argsort(variances)[:self.T_BLOCKS]]
+
+                corr_matrix = np.corrcoef(selected_blocks, rowvar=False)
+                corr_matrix = np.nan_to_num(corr_matrix)
+
+                correlation_results[name] = corr_matrix
+
+            return correlation_results
+        except Exception as e:
+            print(f"AI Detection Error: {str(e)}")
             return None
 
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
-        Y, Cr, Cb = cv2.split(img)
+    def visualize_results(self, correlation_results, parent_window=None):
+        """Visualize results within the tool's interface"""
+        try:
+            if parent_window is None:
+                # Create a new window
+                fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+                fig.suptitle("Noise Correlation Matrices (Y / Cb / Cr)", fontsize=14)
 
-        channels = {
-            "Y": Y,
-            "Cb": Cb,
-            "Cr": Cr
-        }
+                for idx, (name, corr_matrix) in enumerate(correlation_results.items()):
+                    ax = axes[idx]
+                    im = ax.imshow(corr_matrix, cmap="hot")
+                    ax.set_title(f"{name} Channel")
+                    ax.axis("off")
+                    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-        correlation_results = {}
+                plt.tight_layout()
+                plt.show()
+            else:
+                # Display in the tool's interface
+                self.display_in_tool_interface(correlation_results, parent_window)
 
-        for name, channel in channels.items():
-            noise = cv2.filter2D(channel.astype(np.float32), -1, self.LAPLACIAN)
+        except Exception as e:
+            print(f"Visualization Error: {str(e)}")
+            if parent_window:
+                messagebox.showerror("Visualization Error", f"Failed to display AI detection results: {str(e)}")
 
-            h, w = noise.shape
-            h_trim = h - (h % self.BLOCK_SIZE)
-            w_trim = w - (w % self.BLOCK_SIZE)
-            noise = noise[:h_trim, :w_trim]
+    def display_in_tool_interface(self, correlation_results, parent_window):
+        """Display AI detection results in the tool's interface"""
+        try:
+            # Create a new window for AI detection results
+            ai_window = tk.Toplevel(parent_window)
+            ai_window.title("AI Detection - Noise Correlation Analysis")
+            ai_window.geometry("900x600")
+            ai_window.configure(bg="white")
 
-            blocks = view_as_blocks(noise, block_shape=(self.BLOCK_SIZE, self.BLOCK_SIZE))
-            blocks = blocks.reshape(-1, self.BLOCK_SIZE * self.BLOCK_SIZE)
+            # Create a frame for the plots
+            plot_frame = tk.Frame(ai_window, bg="white")
+            plot_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-            means = np.mean(blocks, axis=1)
-            variances = np.var(blocks, axis=1)
+            # Create matplotlib figure
+            fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+            fig.suptitle("Noise Correlation Matrices (Y / Cb / Cr)", fontsize=14)
 
-            idx_mean = np.argsort(np.abs(means))[:self.T_BLOCKS]
-            idx_var = np.argsort(variances)[:self.T_BLOCKS]
+            for idx, (name, corr_matrix) in enumerate(correlation_results.items()):
+                ax = axes[idx]
+                im = ax.imshow(corr_matrix, cmap="hot")
+                ax.set_title(f"{name} Channel", fontsize=12)
+                ax.axis("off")
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-            selected_idx = np.unique(np.concatenate([idx_mean, idx_var]))
-            selected_blocks = blocks[selected_idx]
+            plt.tight_layout()
 
-            if selected_blocks.shape[0] < self.T_BLOCKS:
-                selected_blocks = blocks[np.argsort(variances)[:self.T_BLOCKS]]
+            # Embed matplotlib figure in tkinter window
+            canvas = FigureCanvasTkAgg(fig, master=plot_frame)
+            canvas.draw()
+            canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-            corr_matrix = np.corrcoef(selected_blocks, rowvar=False)
-            corr_matrix = np.nan_to_num(corr_matrix)
+            # Add analysis information
+            info_frame = tk.Frame(ai_window, bg="white")
+            info_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
 
-            correlation_results[name] = corr_matrix
+            info_text = """
+            AI Detection Analysis Results:
 
-        return correlation_results
+            • Y Channel (Luminance): Shows brightness correlations
+            • Cb Channel (Blue-Yellow): Shows color correlations in blue-yellow axis
+            • Cr Channel (Red-Green): Shows color correlations in red-green axis
 
-    def visualize_results(self, correlation_results):
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-        fig.suptitle("Noise Correlation Matrices (Y / Cb / Cr)", fontsize=14)
+            Interpretation:
+            - Natural images typically show random noise patterns
+            - AI-generated or heavily edited images may show regular patterns
+            - Uniform or grid-like patterns may indicate digital manipulation
+            """
 
-        for idx, (name, corr_matrix) in enumerate(correlation_results.items()):
-            ax = axes[idx]
-            im = ax.imshow(corr_matrix, cmap="hot")
-            ax.set_title(f"{name} Channel")
-            ax.axis("off")
-            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            info_label = tk.Label(info_frame, text=info_text, justify=tk.LEFT,
+                                  font=("Arial", 9), bg="white", fg="#333")
+            info_label.pack(side=tk.LEFT, padx=10)
 
-        plt.tight_layout()
-        plt.show()
+            # Add close button
+            close_btn = tk.Button(ai_window, text="Close", command=ai_window.destroy,
+                                  bg="#2196f3", fg="white", font=("Arial", 10))
+            close_btn.pack(pady=10)
+
+            # Store reference to prevent garbage collection
+            ai_window.fig = fig
+            ai_window.canvas = canvas
+
+        except Exception as e:
+            print(f"Interface Display Error: {str(e)}")
+            messagebox.showerror("Display Error", f"Failed to display AI detection results: {str(e)}")
+
 
 class AdvancedImageTimelineAnalyzer:
     def __init__(self):
@@ -815,6 +921,7 @@ class PicForensicsApp:
         self.delete_btn = None
         self.encrypt_btn = None
         self.delete_case_btn = None
+        self.case_hash_btn = None  # Added for case hash button
 
         self.create_widgets()
         self.hide_action_buttons()
@@ -829,340 +936,13 @@ class PicForensicsApp:
         with open(self.case_config_file, 'w') as f:
             json.dump(self.cases, f)
 
-    def create_widgets(self):
-        nav_frame = tk.Frame(self.root, bg="#1976d2", height=40)
-        nav_frame.pack(fill=tk.X, padx=10, pady=5)
-        nav_frame.pack_propagate(False)
-
-        nav_items = ["HOME", "About", "Help", "Exit"]
-        for item in nav_items:
-            btn = tk.Button(nav_frame, text=item, relief=tk.FLAT, bg="#1976d2",
-                            fg="white", font=("Arial", 9),
-                            command=lambda i=item: self.nav_action(i))
-            btn.pack(side=tk.LEFT, padx=10)
-
-        separator = ttk.Separator(self.root, orient=tk.HORIZONTAL)
-        separator.pack(fill=tk.X, padx=10, pady=5)
-
-        main_content = tk.Frame(self.root, bg="#e3f2fd")
-        main_content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        content_row = tk.Frame(main_content, bg="#e3f2fd")
-        content_row.pack(fill=tk.BOTH, expand=True)
-
-        left_frame = tk.Frame(content_row, bg="#e3f2fd")
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.image_frame = tk.Frame(left_frame, width=400, height=300, relief=tk.RAISED,
-                                    bd=2, bg='white')
-        self.image_frame.pack(pady=10)
-        self.image_frame.pack_propagate(False)
-
-        self.image_placeholder = tk.Label(self.image_frame,
-                                          text="No Case Open\nClick 'Open/Create Case' to start",
-                                          fg="gray", font=("Arial", 10), bg='white')
-        self.image_placeholder.pack(expand=True)
-
-        self.navigation_frame = tk.Frame(left_frame, bg="#e3f2fd")
-        self.navigation_frame.pack(fill=tk.X, pady=5)
-
-        self.prev_btn = tk.Button(self.navigation_frame, text="◀ Previous", command=self.previous_image,
-                                  state="disabled", bg="#2196f3", fg="white", font=("Arial", 9))
-        self.prev_btn.pack(side=tk.LEFT, padx=5)
-
-        self.next_btn = tk.Button(self.navigation_frame, text="Next ▶", command=self.next_image,
-                                  state="disabled", bg="#2196f3", fg="white", font=("Arial", 9))
-        self.next_btn.pack(side=tk.LEFT, padx=5)
-
-        self.verify_btn = tk.Button(self.navigation_frame, text="Verify Integrity", command=self.verify_integrity,
-                                    state="disabled", bg="#ff9800", fg="white", font=("Arial", 9))
-        self.verify_btn.pack(side=tk.LEFT, padx=5)
-
-        self.hash_btn = tk.Button(self.navigation_frame, text="Hash Check", command=self.hash_compare_integrity,
-                                  state="disabled", bg="#9c27b0", fg="white", font=("Arial", 9))
-        #self.hash_btn.pack(side=tk.LEFT, padx=5)
-
-        self.image_counter = tk.Label(self.navigation_frame, text="No case open", bg="#e3f2fd", font=("Arial", 9))
-        self.image_counter.pack(side=tk.LEFT, padx=10)
-
-        self.info_frame = tk.LabelFrame(left_frame, text="Image Info", padx=10, pady=10,
-                                        bg="#e3f2fd", fg="#1976d2", font=("Arial", 10, "bold"))
-        self.info_frame.pack(fill=tk.X, pady=(10, 0))
-
-        self.info_data = {
-            "File Size": "No image loaded",
-            "File Format": "No image loaded",
-            "File Path": "No image loaded"
-        }
-
-        self.info_labels = {}
-        row = 0
-        for key, value in self.info_data.items():
-            tk.Label(self.info_frame, text=f"{key}:", font=("Arial", 9, "bold"),
-                     bg="#e3f2fd", fg="#1976d2").grid(row=row, column=0, sticky=tk.W, pady=1)
-            value_label = tk.Label(self.info_frame, text=value, font=("Arial", 9),
-                                   bg="#e3f2fd")
-            value_label.grid(row=row, column=1, sticky=tk.W, pady=1)
-            self.info_labels[key] = value_label
-            row += 1
-
-        tools_frame = tk.Frame(content_row, width=200, bg="#e3f2fd")
-        tools_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(20, 0))
-        tools_frame.pack_propagate(False)
-
-        self.analysis_var = tk.StringVar(value="Analysis Results ▼")
-        analysis_menu = tk.Menubutton(tools_frame, textvariable=self.analysis_var,
-                                      relief=tk.RAISED, width=18, height=1,
-                                      font=("Arial", 10), bg="#2196f3", fg="white")
-        analysis_menu.pack(pady=5, fill=tk.X)
-
-        analysis_dropdown = tk.Menu(analysis_menu, tearoff=0)
-        analysis_dropdown.add_command(label="Meta Data", command=self.meta_data_analysis)
-        analysis_dropdown.add_separator()
-        analysis_dropdown.add_command(label="Time line", command=self.timeline_analysis)
-        analysis_dropdown.add_separator()
-        analysis_dropdown.add_command(label="AI detection", command=self.ai_detection_analysis)
-        analysis_dropdown.add_separator()
-        analysis_dropdown.add_command(label="Hash Check", command=self.hash_compare_integrity)
-        analysis_menu.configure(menu=analysis_dropdown)
-
-        self.tools_var = tk.StringVar(value="Analysis Tools ▼")
-        tools_menu = tk.Menubutton(tools_frame, textvariable=self.tools_var,
-                                   relief=tk.RAISED, width=18, height=1,
-                                   font=("Arial", 10), bg="#2196f3", fg="white")
-        tools_menu.pack(pady=5, fill=tk.X)
-
-        tools_dropdown = tk.Menu(tools_menu, tearoff=0)
-        tools_dropdown.add_command(label="ELA", command=self.ela_analysis)
-        tools_dropdown.add_separator()
-        tools_dropdown.add_command(label="Noise", command=self.noise_analysis)
-        tools_dropdown.add_separator()
-        tools_dropdown.add_command(label="Histogram", command=self.histogram_analysis)
-
-        tools_menu.configure(menu=tools_dropdown)
-
-        spacer = tk.Frame(tools_frame, height=20, bg="#e3f2fd")
-        spacer.pack(fill=tk.X)
-
-        self.case_btn = tk.Button(main_content, text="Open/Create Case", command=self.manage_case,
-                                  bg="#4CAF50", fg="white", font=("Arial", 10),
-                                  relief=tk.RAISED, bd=2)
-        self.case_btn.pack(pady=5)
-
-        self.open_old_btn = tk.Button(main_content, text="Open Old Case", command=self.open_old_case,
-                                      bg="#2196f3", fg="white", font=("Arial", 10),
-                                      relief=tk.RAISED, bd=2)
-        self.open_old_btn.pack(pady=5)
-
-        self.action_buttons_frame = tk.Frame(main_content, bg="#e3f2fd")
-        self.action_buttons_frame.pack(pady=10)
-
-    def hide_action_buttons(self):
-        for widget in self.action_buttons_frame.winfo_children():
-            widget.destroy()
-
-    def show_action_buttons(self):
-        self.hide_action_buttons()
-
-        self.open_btn = tk.Button(self.action_buttons_frame, text="Upload Folder", command=self.open_folder,
-                                  bg="#2196f3", fg="white", font=("Arial", 10),
-                                  relief=tk.RAISED, bd=2)
-        self.open_btn.pack(side=tk.LEFT, padx=5)
-
-        self.delete_btn = tk.Button(self.action_buttons_frame, text="Delete Image", command=self.delete_image,
-                                    bg="#2196f3", fg="white", font=("Arial", 10),
-                                    relief=tk.RAISED, bd=2)
-        self.delete_btn.pack(side=tk.LEFT, padx=5)
-
-        self.encrypt_btn = tk.Button(self.action_buttons_frame, text="Encrypt/Decrypt",
-                                     command=self.encrypt_decrypt_menu,
-                                     bg="#FF5722", fg="white", font=("Arial", 10),
-                                     relief=tk.RAISED, bd=2)
-        self.encrypt_btn.pack(side=tk.LEFT, padx=5)
-
-        self.case_hash_btn = tk.Button(self.action_buttons_frame, text="Case Hash", command=self.case_hash_integrity,
-                                       bg="#673ab7", fg="white", font=("Arial", 10),
-                                       relief=tk.RAISED, bd=2)
-        self.case_hash_btn.pack(side=tk.LEFT, padx=5)
-
-        self.delete_case_btn = tk.Button(self.action_buttons_frame, text="Delete Case", command=self.delete_case,
-                                         bg="#f44336", fg="white", font=("Arial", 10),
-                                         relief=tk.RAISED, bd=2)
-        self.delete_case_btn.pack(side=tk.LEFT, padx=5)
-
-    def nav_action(self, item):
-        if item == "Exit":
-            self.cleanup_temp_files()
-            self.root.quit()
-        elif item == "HOME":
-            self.show_home_dashboard()
-        elif item == "About":
-            self.show_about_info()
-        elif item == "Help":
-            self.show_help_info()
-
-    def cleanup_temp_files(self):
-        for temp_path in self.temp_images.values():
-            try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except:
-                pass
-        self.temp_images.clear()
-
-    def show_home_dashboard(self):
-        home_window = tk.Toplevel(self.root)
-        home_window.title("PicForensics - Dashboard")
-        home_window.geometry("600x400")
-        home_window.configure(bg="#f5f5f5")
-
-        header = tk.Label(home_window, text="📷 PicForensics",
-                          font=("Arial", 16, "bold"), bg="#f5f5f5", fg="#1976d2")
-        header.pack(pady=20)
-
-        stats_frame = tk.Frame(home_window, bg="#f5f5f5")
-        stats_frame.pack(pady=10)
-
-        current_case = f"{self.current_case_name} ({self.current_case_id})" if self.current_case_name else "None"
-        encrypted_count = sum(1 for img in self.uploaded_images if img.endswith('.enc'))
-        decrypted_count = len(self.uploaded_images) - encrypted_count
-
-        stats = [
-            f"📁 Current Case: {current_case}",
-            f"📷 Total Images: {len(self.uploaded_images)}",
-            f"🔒 Encrypted Images: {encrypted_count}",
-            f"🔓 Decrypted Images: {decrypted_count}",
-            f"🛠️ Tools Available: 5 Analysis Methods",
-            f"📊 Cases Saved: {len(self.cases)}"
-        ]
-
-        for stat in stats:
-            lbl = tk.Label(stats_frame, text=stat, font=("Arial", 11),
-                           bg="#f5f5f5", fg="#333")
-            lbl.pack(pady=5)
-
-        close_btn = tk.Button(home_window, text="Close Dashboard",
-                              command=home_window.destroy,
-                              bg="#2196f3", fg="white", font=("Arial", 10))
-        close_btn.pack(pady=10)
-
-    def show_about_info(self):
-        about_text = """PicForensics
-
-Version: 5.0 with Complete Encryption System
-Advanced Image Forensics & Security Tool
-
-Features:
-• Case-based management with full encryption
-• Images encrypted both in tool and source location
-• Cannot view encrypted images without password
-• Decryption restores images in both locations
-• AES-128 Secure Image Encryption
-• Advanced Metadata Extraction with exifread
-• AI Detection using Noise Correlation Analysis
-• Hash Detection using SHA - 256"""
-
-        messagebox.showinfo("About PicForensics", about_text)
-
-    def show_help_info(self):
-        help_text = """PicForensics Help Guide
-
-Complete Encryption System:
-• Encrypt Current Image: Encrypts image in tool AND original location
-• Decrypt for Analysis: Temporary decryption for analysis only
-• Encrypt Entire Folder: Encrypts all images in source folder
-• Decrypt All: Permanently decrypts all images in case
-
-New Features:
-• Advanced Metadata Extraction using exifread library
-• AI Detection using Noise Correlation Analysis
-• Forensic analysis with consistency scoring
-• GPS geocoding and reverse geolocation
-
-Security Features:
-• Images encrypted in both tool AND source location
-• Cannot view encrypted images without password
-• When opening old case: encrypted images remain encrypted
-• Decryption restores images in both locations
-• No images visible until decrypted
-• Hash Detection """
-
-        messagebox.showinfo("Help Guide", help_text)
-
-    def verify_integrity(self):
-        if not self.current_image:
-            messagebox.showwarning("No Image", "Please load an image first!")
-            return
-
-        try:
-            if self.current_image.endswith('.enc'):
-                if self.current_image not in self.temp_images:
-                    messagebox.showwarning("Encrypted Image", "Please decrypt the image for analysis first!")
-                    return
-                image_to_check = self.temp_images[self.current_image]
-            else:
-                image_to_check = self.current_image
-
-            integrity_report = "Integrity Verification Report\n\n"
-
-            file_size = os.path.getsize(image_to_check) / (1024 * 1024)
-            integrity_report += f"File Size: {file_size:.2f} MB\n"
-
-            image = Image.open(image_to_check)
-            integrity_report += f"Dimensions: {image.width} x {image.height}\n"
-            integrity_report += f"Format: {image.format}\n\n"
-
-            timeline_result = self.timeline_analyzer.analyze_image(image_to_check)
-            integrity_report += f"Best Guess Date: {timeline_result.best_guess_date}\n"
-
-            if self.current_image.endswith('.enc'):
-                integrity_report += "\n⚠️ NOTE: This is a decrypted temporary copy\n"
-                integrity_report += "Original file remains encrypted (.enc)\n"
-
-            if file_size < 0.1 and image.width * image.height > 1000000:
-                integrity_report += "\nWARNING: High resolution with small file size\n"
-
-            messagebox.showinfo("Integrity Verification", integrity_report)
-
-        except Exception as e:
-            messagebox.showerror("Error", f"Integrity verification failed: {str(e)}")
-
-    def update_navigation_buttons(self):
-        if len(self.uploaded_images) <= 1:
-            self.prev_btn.config(state="disabled")
-            self.next_btn.config(state="disabled")
-        else:
-            self.prev_btn.config(state="normal")
-            self.next_btn.config(state="normal")
-
-        if self.uploaded_images:
-            self.image_counter.config(text=f"Image {self.current_image_index + 1} of {len(self.uploaded_images)}")
-            self.verify_btn.config(state="normal")
-            self.hash_btn.config(state="normal")
-        else:
-            self.image_counter.config(text="No images in case")
-            self.verify_btn.config(state="disabled")
-            self.hash_btn.config(state="disabled")
-
-    def previous_image(self):
-        if self.uploaded_images and self.current_image_index > 0:
-            self.current_image_index -= 1
-            self.load_current_image()
-
-    def next_image(self):
-        if self.uploaded_images and self.current_image_index < len(self.uploaded_images) - 1:
-            self.current_image_index += 1
-            self.load_current_image()
-
-        # ─────────────────────────── Hash Features ───────────────────────────
-
+    # ========== HASH METHODS ==========
     def _hash_registry_file(self) -> str | None:
         if not self.current_case_folder:
             return None
         return os.path.join(self.current_case_folder, "hash_registry.json")
 
     def auto_save_hash_for_current_image(self, show_popup: bool = False):
-
         try:
             if not getattr(self, "current_image", None) or not getattr(self, "current_case_folder", None):
                 return
@@ -1227,7 +1007,6 @@ Security Features:
             return
 
     def hash_compare_integrity(self):
-
         if not getattr(self, "current_image", None):
             messagebox.showwarning("No Image Loaded", "⚠ Please open an image first.")
             return
@@ -1340,6 +1119,335 @@ Security Features:
             )
             self.show_analysis_results("Case Hash Result", msg)
 
+    # ========== END HASH METHODS ==========
+
+    def create_widgets(self):
+        nav_frame = tk.Frame(self.root, bg="#1976d2", height=40)
+        nav_frame.pack(fill=tk.X, padx=10, pady=5)
+        nav_frame.pack_propagate(False)
+
+        nav_items = ["HOME", "About", "Help", "Exit"]
+        for item in nav_items:
+            btn = tk.Button(nav_frame, text=item, relief=tk.FLAT, bg="#1976d2",
+                            fg="white", font=("Arial", 9),
+                            command=lambda i=item: self.nav_action(i))
+            btn.pack(side=tk.LEFT, padx=10)
+
+        separator = ttk.Separator(self.root, orient=tk.HORIZONTAL)
+        separator.pack(fill=tk.X, padx=10, pady=5)
+
+        main_content = tk.Frame(self.root, bg="#e3f2fd")
+        main_content.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        content_row = tk.Frame(main_content, bg="#e3f2fd")
+        content_row.pack(fill=tk.BOTH, expand=True)
+
+        left_frame = tk.Frame(content_row, bg="#e3f2fd")
+        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.image_frame = tk.Frame(left_frame, width=400, height=300, relief=tk.RAISED,
+                                    bd=2, bg='white')
+        self.image_frame.pack(pady=10)
+        self.image_frame.pack_propagate(False)
+
+        self.image_placeholder = tk.Label(self.image_frame,
+                                          text="No Case Open\nClick 'Open/Create Case' to start",
+                                          fg="gray", font=("Arial", 10), bg='white')
+        self.image_placeholder.pack(expand=True)
+
+        self.navigation_frame = tk.Frame(left_frame, bg="#e3f2fd")
+        self.navigation_frame.pack(fill=tk.X, pady=5)
+
+        self.prev_btn = tk.Button(self.navigation_frame, text="◀ Previous", command=self.previous_image,
+                                  state="disabled", bg="#2196f3", fg="white", font=("Arial", 9))
+        self.prev_btn.pack(side=tk.LEFT, padx=5)
+
+        self.next_btn = tk.Button(self.navigation_frame, text="Next ▶", command=self.next_image,
+                                  state="disabled", bg="#2196f3", fg="white", font=("Arial", 9))
+        self.next_btn.pack(side=tk.LEFT, padx=5)
+
+        self.verify_btn = tk.Button(self.navigation_frame, text="Verify Integrity", command=self.verify_integrity,
+                                    state="disabled", bg="#ff9800", fg="white", font=("Arial", 9))
+        self.verify_btn.pack(side=tk.LEFT, padx=5)
+
+        # REMOVED: Hash button from navigation frame
+        # self.hash_btn = tk.Button(self.navigation_frame, text="Hash Check", command=self.hash_compare_integrity,
+        #                           state="disabled", bg="#9c27b0", fg="white", font=("Arial", 9))
+        # self.hash_btn.pack(side=tk.LEFT, padx=5)
+
+        self.image_counter = tk.Label(self.navigation_frame, text="No case open", bg="#e3f2fd", font=("Arial", 9))
+        self.image_counter.pack(side=tk.LEFT, padx=10)
+
+        self.info_frame = tk.LabelFrame(left_frame, text="Image Info", padx=10, pady=10,
+                                        bg="#e3f2fd", fg="#1976d2", font=("Arial", 10, "bold"))
+        self.info_frame.pack(fill=tk.X, pady=(10, 0))
+
+        self.info_data = {
+            "File Size": "No image loaded",
+            "File Format": "No image loaded",
+            "File Path": "No image loaded"
+        }
+
+        self.info_labels = {}
+        row = 0
+        for key, value in self.info_data.items():
+            tk.Label(self.info_frame, text=f"{key}:", font=("Arial", 9, "bold"),
+                     bg="#e3f2fd", fg="#1976d2").grid(row=row, column=0, sticky=tk.W, pady=1)
+            value_label = tk.Label(self.info_frame, text=value, font=("Arial", 9),
+                                   bg="#e3f2fd")
+            value_label.grid(row=row, column=1, sticky=tk.W, pady=1)
+            self.info_labels[key] = value_label
+            row += 1
+
+        tools_frame = tk.Frame(content_row, width=200, bg="#e3f2fd")
+        tools_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(20, 0))
+        tools_frame.pack_propagate(False)
+
+        self.analysis_var = tk.StringVar(value="Analysis Results ▼")
+        analysis_menu = tk.Menubutton(tools_frame, textvariable=self.analysis_var,
+                                      relief=tk.RAISED, width=18, height=1,
+                                      font=("Arial", 10), bg="#2196f3", fg="white")
+        analysis_menu.pack(pady=5, fill=tk.X)
+
+        analysis_dropdown = tk.Menu(analysis_menu, tearoff=0)
+        analysis_dropdown.add_command(label="Meta Data", command=self.meta_data_analysis)
+        analysis_dropdown.add_separator()
+        analysis_dropdown.add_command(label="Time line", command=self.timeline_analysis)
+        analysis_dropdown.add_separator()
+        analysis_dropdown.add_command(label="AI detection", command=self.ai_detection_analysis)
+        # Added hash to analysis dropdown
+        analysis_dropdown.add_separator()
+        analysis_dropdown.add_command(label="Hash Check", command=self.hash_compare_integrity)
+
+        analysis_menu.configure(menu=analysis_dropdown)
+
+        self.tools_var = tk.StringVar(value="Analysis Tools ▼")
+        tools_menu = tk.Menubutton(tools_frame, textvariable=self.tools_var,
+                                   relief=tk.RAISED, width=18, height=1,
+                                   font=("Arial", 10), bg="#2196f3", fg="white")
+        tools_menu.pack(pady=5, fill=tk.X)
+
+        tools_dropdown = tk.Menu(tools_menu, tearoff=0)
+        tools_dropdown.add_command(label="ELA", command=self.ela_analysis)
+        tools_dropdown.add_separator()
+        tools_dropdown.add_command(label="Noise", command=self.noise_analysis)
+        tools_dropdown.add_separator()
+        tools_dropdown.add_command(label="Histogram", command=self.histogram_analysis)
+
+        tools_menu.configure(menu=tools_dropdown)
+
+        spacer = tk.Frame(tools_frame, height=20, bg="#e3f2fd")
+        spacer.pack(fill=tk.X)
+
+        self.case_btn = tk.Button(main_content, text="Open/Create Case", command=self.manage_case,
+                                  bg="#4CAF50", fg="white", font=("Arial", 10),
+                                  relief=tk.RAISED, bd=2)
+        self.case_btn.pack(pady=5)
+
+        self.open_old_btn = tk.Button(main_content, text="Open Old Case", command=self.open_old_case,
+                                      bg="#2196f3", fg="white", font=("Arial", 10),
+                                      relief=tk.RAISED, bd=2)
+        self.open_old_btn.pack(pady=5)
+
+        self.action_buttons_frame = tk.Frame(main_content, bg="#e3f2fd")
+        self.action_buttons_frame.pack(pady=10)
+
+    def hide_action_buttons(self):
+        for widget in self.action_buttons_frame.winfo_children():
+            widget.destroy()
+        self.case_hash_btn = None  # Reset case hash button reference
+
+    def show_action_buttons(self):
+        self.hide_action_buttons()
+
+        self.open_btn = tk.Button(self.action_buttons_frame, text="Upload Folder", command=self.open_folder,
+                                  bg="#2196f3", fg="white", font=("Arial", 10),
+                                  relief=tk.RAISED, bd=2)
+        self.open_btn.pack(side=tk.LEFT, padx=5)
+
+        self.delete_btn = tk.Button(self.action_buttons_frame, text="Delete Image", command=self.delete_image,
+                                    bg="#2196f3", fg="white", font=("Arial", 10),
+                                    relief=tk.RAISED, bd=2)
+        self.delete_btn.pack(side=tk.LEFT, padx=5)
+
+        self.encrypt_btn = tk.Button(self.action_buttons_frame, text="Encrypt/Decrypt",
+                                     command=self.encrypt_decrypt_menu,
+                                     bg="#FF5722", fg="white", font=("Arial", 10),
+                                     relief=tk.RAISED, bd=2)
+        self.encrypt_btn.pack(side=tk.LEFT, padx=5)
+
+        # Added case hash button - only appears when case is open
+        self.case_hash_btn = tk.Button(self.action_buttons_frame, text="Case Hash", command=self.case_hash_integrity,
+                                       bg="#673ab7", fg="white", font=("Arial", 10),
+                                       relief=tk.RAISED, bd=2)
+        self.case_hash_btn.pack(side=tk.LEFT, padx=5)
+
+        self.delete_case_btn = tk.Button(self.action_buttons_frame, text="Delete Case", command=self.delete_case,
+                                         bg="#f44336", fg="white", font=("Arial", 10),
+                                         relief=tk.RAISED, bd=2)
+        self.delete_case_btn.pack(side=tk.LEFT, padx=5)
+
+    def nav_action(self, item):
+        if item == "Exit":
+            self.cleanup_temp_files()
+            self.root.quit()
+        elif item == "HOME":
+            self.show_home_dashboard()
+        elif item == "About":
+            self.show_about_info()
+        elif item == "Help":
+            self.show_help_info()
+
+    def cleanup_temp_files(self):
+        for temp_path in self.temp_images.values():
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except:
+                pass
+        self.temp_images.clear()
+
+    def show_home_dashboard(self):
+        home_window = tk.Toplevel(self.root)
+        home_window.title("PicForensics - Dashboard")
+        home_window.geometry("600x400")
+        home_window.configure(bg="#f5f5f5")
+
+        header = tk.Label(home_window, text="📷 PicForensics",
+                          font=("Arial", 16, "bold"), bg="#f5f5f5", fg="#1976d2")
+        header.pack(pady=20)
+
+        stats_frame = tk.Frame(home_window, bg="#f5f5f5")
+        stats_frame.pack(pady=10)
+
+        current_case = f"{self.current_case_name} ({self.current_case_id})" if self.current_case_name else "None"
+        encrypted_count = sum(1 for img in self.uploaded_images if img.endswith('.enc'))
+        decrypted_count = len(self.uploaded_images) - encrypted_count
+
+        stats = [
+            f"📁 Current Case: {current_case}",
+            f"📷 Total Images: {len(self.uploaded_images)}",
+            f"🔒 Encrypted Images: {encrypted_count}",
+            f"🔓 Decrypted Images: {decrypted_count}",
+            f"🛠️ Tools Available: 5 Analysis Methods",
+            f"📊 Cases Saved: {len(self.cases)}"
+        ]
+
+        for stat in stats:
+            lbl = tk.Label(stats_frame, text=stat, font=("Arial", 11),
+                           bg="#f5f5f5", fg="#333")
+            lbl.pack(pady=5)
+
+        close_btn = tk.Button(home_window, text="Close Dashboard",
+                              command=home_window.destroy,
+                              bg="#2196f3", fg="white", font=("Arial", 10))
+        close_btn.pack(pady=10)
+
+    def show_about_info(self):
+        about_text = """PicForensics
+
+Version: 5.0 with Complete Encryption System
+Advanced Image Forensics & Security Tool
+
+Features:
+• Case-based management with full encryption
+• Images encrypted both in tool and source location
+• Cannot view encrypted images without password
+• Decryption restores images in both locations
+• AES-128 Secure Image Encryption
+• Advanced Metadata Extraction with exifread
+• AI Detection using Noise Correlation Analysis
+• Hash Detection using SHA-256"""  # Added hash feature to about text
+        messagebox.showinfo("About PicForensics", about_text)
+
+    def show_help_info(self):
+        help_text = """PicForensics Help Guide
+
+Complete Encryption System:
+• Encrypt Current Image: Encrypts image in tool AND original location
+• Decrypt for Analysis: Temporary decryption for analysis only
+• Encrypt Entire Folder: Encrypts all images in source folder
+• Decrypt All: Permanently decrypts all images in case
+
+New Features:
+• Advanced Metadata Extraction using exifread library
+• AI Detection using Noise Correlation Analysis
+• Forensic analysis with consistency scoring
+• GPS geocoding and reverse geolocation
+• Hash Detection using SHA-256 for tamper detection
+
+Security Features:
+• Images encrypted in both tool AND source location
+• Cannot view encrypted images without password
+• When opening old case: encrypted images remain encrypted
+• Decryption restores images in both locations
+• No images visible until decrypted
+• Hash Detection for image integrity verification"""  # Added hash feature to help text
+        messagebox.showinfo("Help Guide", help_text)
+
+    def verify_integrity(self):
+        if not self.current_image:
+            messagebox.showwarning("No Image", "Please load an image first!")
+            return
+
+        try:
+            if self.current_image.endswith('.enc'):
+                if self.current_image not in self.temp_images:
+                    messagebox.showwarning("Encrypted Image", "Please decrypt the image for analysis first!")
+                    return
+                image_to_check = self.temp_images[self.current_image]
+            else:
+                image_to_check = self.current_image
+
+            integrity_report = "Integrity Verification Report\n\n"
+
+            file_size = os.path.getsize(image_to_check) / (1024 * 1024)
+            integrity_report += f"File Size: {file_size:.2f} MB\n"
+
+            image = Image.open(image_to_check)
+            integrity_report += f"Dimensions: {image.width} x {image.height}\n"
+            integrity_report += f"Format: {image.format}\n\n"
+
+            timeline_result = self.timeline_analyzer.analyze_image(image_to_check)
+            integrity_report += f"Best Guess Date: {timeline_result.best_guess_date}\n"
+
+            if self.current_image.endswith('.enc'):
+                integrity_report += "\n⚠️ NOTE: This is a decrypted temporary copy\n"
+                integrity_report += "Original file remains encrypted (.enc)\n"
+
+            if file_size < 0.1 and image.width * image.height > 1000000:
+                integrity_report += "\nWARNING: High resolution with small file size\n"
+
+            messagebox.showinfo("Integrity Verification", integrity_report)
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Integrity verification failed: {str(e)}")
+
+    def update_navigation_buttons(self):
+        if len(self.uploaded_images) <= 1:
+            self.prev_btn.config(state="disabled")
+            self.next_btn.config(state="disabled")
+        else:
+            self.prev_btn.config(state="normal")
+            self.next_btn.config(state="normal")
+
+        if self.uploaded_images:
+            self.image_counter.config(text=f"Image {self.current_image_index + 1} of {len(self.uploaded_images)}")
+            self.verify_btn.config(state="normal")
+        else:
+            self.image_counter.config(text="No images in case")
+            self.verify_btn.config(state="disabled")
+
+    def previous_image(self):
+        if self.uploaded_images and self.current_image_index > 0:
+            self.current_image_index -= 1
+            self.load_current_image()
+
+    def next_image(self):
+        if self.uploaded_images and self.current_image_index < len(self.uploaded_images) - 1:
+            self.current_image_index += 1
+            self.load_current_image()
+
     def load_current_image(self):
         if 0 <= self.current_image_index < len(self.uploaded_images):
             image_path = self.uploaded_images[self.current_image_index]
@@ -1356,13 +1464,11 @@ Security Features:
             else:
                 self.load_and_display_image(image_path)
                 self.update_image_info(image_path)
+            # Added auto hash check
             self.auto_save_hash_for_current_image()
             self.update_navigation_buttons()
 
-    def load_and_display_image(self, file_path, set_current=True):
-        if set_current:
-            self.current_image = file_path
-
+    def load_and_display_image(self, file_path):
         self.image_placeholder.pack_forget()
         try:
             image = Image.open(file_path)
@@ -1405,11 +1511,9 @@ Security Features:
                 for file in files:
                     if file.lower().endswith(image_extensions):
                         src_path = os.path.join(root, file)
+                        self.image_source_paths[src_path] = src_path
                         dest_path = os.path.join(self.current_case_folder, file)
-
                         shutil.copy2(src_path, dest_path)
-
-                        self.image_source_paths[dest_path] = src_path
                         self.uploaded_images.append(dest_path)
                         self.encryption_status[dest_path] = False
 
@@ -1417,11 +1521,9 @@ Security Features:
                 for file in files:
                     if file.lower().endswith('.enc'):
                         src_path = os.path.join(root, file)
+                        self.image_source_paths[src_path] = src_path
                         dest_path = os.path.join(self.current_case_folder, file)
-
                         shutil.copy2(src_path, dest_path)
-
-                        self.image_source_paths[dest_path] = src_path
                         self.uploaded_images.append(dest_path)
                         self.encryption_status[dest_path] = True
 
@@ -1755,7 +1857,7 @@ Security Features:
                     temp_file.close()
 
                     self.temp_images[self.current_image] = temp_file.name
-                    self.load_and_display_image(temp_file.name, set_current=False)
+                    self.load_and_display_image(temp_file.name)
                     self.update_image_info(self.current_image)
 
                     messagebox.showinfo("Success",
@@ -2190,7 +2292,8 @@ Security Features:
                 messagebox.showerror("Error", "Failed to analyze image for AI detection")
                 return
 
-            self.ai_detector.visualize_results(correlation_results)
+            # Display results in the tool's interface
+            self.ai_detector.visualize_results(correlation_results, self.root)
 
         except Exception as e:
             messagebox.showerror("Error", f"AI detection analysis failed: {str(e)}")
